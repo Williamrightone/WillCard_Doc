@@ -38,3 +38,4 @@ The system settles exclusively in New Taiwan Dollar (TWD). All foreign currency 
 
 ## Table of Contents
 
+1. [System Architecture](/guideline/1-system-architecture.md)
