@@ -1,8 +1,32 @@
-# WillTick & WillPay
+# WillCard
 
-WillPay 是一個仿 PayPal 設計的獨立支付服務，提供錢包管理、交易處理與帳務記錄等核心金融功能, 而 WillTicket 則是一個提供網路售票服務的平台，協助活動主辦方（企業戶）在線上販售活動票券，並提供消費者流暢的搶票與購票體驗.
+> An Electronic Payment Wallet System
 
-WillTicket 與 WillPay 是兩個完全獨立的系統, WillTicket 在購票時使用 WillPay 所提供的支付功能.
+WillCard is a **microservices-based** electronic payment wallet system built on **Java Spring Boot**, inspired by the core design principles of Taiwan Banking, Credit Card and e-payment. It integrates three primary capabilities: credit card transaction authorization, e-wallet top-up, and points rewards.
 
+The system settles exclusively in New Taiwan Dollar (TWD). All foreign currency transactions are converted to TWD at the time of the transaction using a locked exchange rate. No foreign currency positions are held in user accounts.
 
+## Core Features
+
+- **Virtual Credit Card (WillCard)**: Issuing virtual cards with support for credit card authorization and OTP two-factor verification
+- **E-Wallet**: TWD points balance management, supporting top-up via credit card and wallet balance payments
+- **Points Rewards**: Consumer spending rewards calculated in a T+N batch job; points become available after the settlement date
+- **Foreign Currency Support**: Real-time exchange rate locking at transaction time; FX conversion to TWD before debit
+- **Dual Reconciliation**: T+0 real-time reconciliation + T+1 batch settlement with full audit trail
+
+## Technology Stack
+
+| Layer | Technology |
+| --- | --- |
+| Backend Framework | Java 17 + Spring Boot 3.4.5 |
+| Architecture Pattern | Microservices + BFF + Saga Orchestration |
+| Container Platform | Kubernetes (kubeadm) |
+| Primary Database | MySQL 8 + Spring Data JPA (Hibernate)|
+| Cache | Redis 7 |
+| Message Queue | Kafka (event bus) + RabbitMQ (notification buffering) |
+| Batch Scheduling | XXL-Job + Spring Batch |
+| Observability | Jaeger + Prometheus + Grafana + EFK Stack |
+| Security | Spring Security (BFF only) + JWT + AES-256 (card encryption) |
+
+## Table of Contents
 
