@@ -288,3 +288,5 @@ public abstract class BaseTimeEntity {
 - `BaseTimeEntity` is defined in `common-biz` and must be extended by all Entities across every `*-service`
 - Entities must not set `createdAt` or `updatedAt` manually — both fields are managed exclusively by JPA lifecycle callbacks
 - `@MappedSuperclass` ensures the fields are mapped to the subclass table, without creating a separate table
+
+Next Chapter: [Exception](/guideline/5-exception.md)

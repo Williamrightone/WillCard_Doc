@@ -288,3 +288,5 @@ public abstract class BaseTimeEntity {
 - `BaseTimeEntity` 定義於 `common-biz`，所有 `*-service` 的 Entity 皆須繼承
 - Entity 本身不得手動設定 `createdAt` 或 `updatedAt`，由 JPA lifecycle callback 統一管理
 - `@MappedSuperclass` 確保欄位對應到子類別的資料表，不產生獨立的表
+
+下一章: [異常處置](/guideline/5-exception-zh-tw.md)
