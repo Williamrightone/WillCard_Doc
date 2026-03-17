@@ -247,3 +247,44 @@ V1.0.1__create_table_role.sql
 V1.0.6__alter_table_function_menu_add_column_permission_code.sql
 V1.1.0__create_table_wallet.sql
 ```
+
+## 5. BaseTimeEntity
+ 
+All JPA Entities must extend `BaseTimeEntity` to ensure consistent management of creation and update timestamps.
+ 
+```java
+@MappedSuperclass
+@Getter
+@Setter
+public abstract class BaseTimeEntity {
+ 
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+ 
+    @Column(name = "updated_at", nullable = false)
+    private LocalDateTime updatedAt;
+ 
+    @PrePersist
+    protected void onCreate() {
+        LocalDateTime now = LocalDateTime.now();
+        this.createdAt = now;
+        this.updatedAt = now;
+    }
+ 
+    @PreUpdate
+    protected void onUpdate() {
+        this.updatedAt = LocalDateTime.now();
+    }
+}
+```
+ 
+| Field | Description |
+|---|---|
+| `created_at` | Timestamp of record creation. Immutable after insert (`updatable = false`) |
+| `updated_at` | Timestamp of the last update. Automatically refreshed on every `@PreUpdate` |
+ 
+**Rules**
+ 
+- `BaseTimeEntity` is defined in `common-biz` and must be extended by all Entities across every `*-service`
+- Entities must not set `createdAt` or `updatedAt` manually — both fields are managed exclusively by JPA lifecycle callbacks
+- `@MappedSuperclass` ensures the fields are mapped to the subclass table, without creating a separate table

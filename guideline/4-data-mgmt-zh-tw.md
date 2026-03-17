@@ -247,3 +247,44 @@ V1.0.1__create_table_role.sql
 V1.0.6__alter_table_function_menu_add_column_permission_code.sql
 V1.1.0__create_table_wallet.sql
 ```
+
+## 5. BaseTimeEntity
+ 
+所有 JPA Entity 必須繼承 `BaseTimeEntity`，統一管理建立時間與更新時間。
+ 
+```java
+@MappedSuperclass
+@Getter
+@Setter
+public abstract class BaseTimeEntity {
+ 
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+ 
+    @Column(name = "updated_at", nullable = false)
+    private LocalDateTime updatedAt;
+ 
+    @PrePersist
+    protected void onCreate() {
+        LocalDateTime now = LocalDateTime.now();
+        this.createdAt = now;
+        this.updatedAt = now;
+    }
+ 
+    @PreUpdate
+    protected void onUpdate() {
+        this.updatedAt = LocalDateTime.now();
+    }
+}
+```
+ 
+| 欄位 | 說明 |
+|---|---|
+| `created_at` | 資料建立時間，寫入後不可更新（`updatable = false`） |
+| `updated_at` | 資料最後更新時間，每次 `@PreUpdate` 自動刷新 |
+ 
+**規則**
+ 
+- `BaseTimeEntity` 定義於 `common-biz`，所有 `*-service` 的 Entity 皆須繼承
+- Entity 本身不得手動設定 `createdAt` 或 `updatedAt`，由 JPA lifecycle callback 統一管理
+- `@MappedSuperclass` 確保欄位對應到子類別的資料表，不產生獨立的表
