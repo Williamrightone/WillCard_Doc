@@ -149,3 +149,4 @@ graph TB
 
 All VMs run **Ubuntu 22.04 LTS**. Fluentd is deployed as a DaemonSet on the two worker nodes and does not consume resources on `vm-observe`.
 
+Next Chapter: [Project Architecture](/guideline/3-project-architecture-structure.md)

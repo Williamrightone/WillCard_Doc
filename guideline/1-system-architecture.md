@@ -93,3 +93,5 @@ graph TB
     NOTIFY --> MQ
     CARD --> MQ
 ```
+
+Next Chapter: [Infrastructure Configuration](/guideline/2-infrastructure.md)

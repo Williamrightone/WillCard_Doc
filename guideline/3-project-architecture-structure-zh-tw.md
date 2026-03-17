@@ -487,3 +487,5 @@ Domain Service → Port（介面）
           ├── RepositoryImpl   （JPA）
           └── DataGripHelper   （跨表組裝）
 ```
+
+下一章: [資料管理](/guideline/4-data-mgmt-zh-tw.md)

@@ -485,3 +485,5 @@ Domain Service → Port (interface)
           ├── RepositoryImpl   (JPA)
           └── DataGripHelper   (cross-table assembly)
 ```
+
+Next Chapter: [Data Management](/guideline/4-data-mgmt.md)

@@ -93,3 +93,5 @@ graph TB
     NOTIFY --> MQ
     CARD --> MQ
 ```
+
+下一章: [基礎設施配置](/guideline/2-infrastructure-zh-tw.md)

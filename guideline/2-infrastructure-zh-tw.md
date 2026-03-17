@@ -163,3 +163,5 @@ graph TB
 ### VM 作業系統
 
 所有 VM 均運行 **Ubuntu 22.04 LTS**。Fluentd 以 DaemonSet 形式部署於兩台工作節點上，不佔用 `vm-observe` 的資源。
+
+下一章: [專案架構](/guideline/3-project-architecture-structure-zh-tw.md)
