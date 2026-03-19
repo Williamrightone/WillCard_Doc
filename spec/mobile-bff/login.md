@@ -86,9 +86,22 @@ The BFF `LoginRq` (`application.api.dto`) and the auth-contract `LoginRq` (`auth
 | 2 | `[VALIDATE]` | `LoginAssembler.toAuthRq(rq)` converts BFF LoginRq to auth-contract LoginRq | — |
 | 3 | `[FEIGN]` | `AuthClientAdapter` calls auth-service → [auth-service/login.en.md](../auth-service/login.en.md) | Business error → proceed to step 4; system error → throw `INTERNAL_ERROR` |
 | 4 | `[REDIS WRITE]` | On login failure: increment `login:attempt:{account}`, TTL 1200s; write `login:lock:{account}` when count reaches 3, TTL 1200s | — |
-| 5 | `[HEADER]` | On login success: extract `accessToken` from auth-contract LoginRs, set `Authorization: Bearer {token}` | — |
+| 5 | `[HEADER]` | On login success: extract `accessToken` from auth-contract LoginRs, set `Authorization: Bearer {token}`; assemble identity headers from LoginRs and inject downstream (see Header Forwarding) | — |
 | 6 | `[KAFKA]` | Publish `operation-log.auth.login` event (async — failure does not affect main flow) | Log the error, do not throw exception |
 | 7 | `[RETURN]` | `LoginAssembler.toLoginRs(authRs)` assembles BFF LoginRs (without accessToken) and returns | — |
+
+### Header Forwarding
+
+On successful login, the BFF extracts identity data from the auth-contract LoginRs and injects it as request headers for use in subsequent requests.  
+Downstream services read these headers via `MemberContextFilter` (auto-configured by `common-biz`) — no manual parsing required.
+
+| Header | Source Field | Description |
+|--------|--------------|-------------|
+| `X-Member-Id` | `LoginRs.memberId` | Snowflake ID (String) |
+| `X-Role` | `LoginRs.role` | MEMBER / ADMIN |
+| `X-Name` | `LoginRs.name` | Display name |
+
+> **Note:** These three headers are injected by the BFF on every authenticated request, not only during login. Login establishes the Session; header forwarding is the shared mechanism for all subsequent APIs. See `spec/common-biz/member-context.md`.
 
 ### Rate Limit Design
 

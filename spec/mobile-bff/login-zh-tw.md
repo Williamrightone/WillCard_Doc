@@ -86,9 +86,22 @@ BFF 的 `LoginRq`（`application.api.dto`）與 auth-contract 的 `LoginRq`（`a
 | 2 | `[VALIDATE]` | `LoginAssembler.toAuthRq(rq)` 將 BFF LoginRq 轉換為 auth-contract LoginRq | — |
 | 3 | `[FEIGN]` | `AuthClientAdapter` 呼叫 auth-service → [auth-service/login.md](../auth-service/login.md) | auth-service 回傳業務錯誤 → 執行步驟 4；系統錯誤 → 拋出 `INTERNAL_ERROR` |
 | 4 | `[REDIS WRITE]` | 登入失敗時：`login:attempt:{account}` 計數 +1，TTL 1200s；計數達 3 時，另寫入 `login:lock:{account}`，TTL 1200s | — |
-| 5 | `[HEADER]` | 登入成功：從 auth-contract LoginRs 取出 `accessToken`，設入 `Authorization: Bearer {token}` | — |
+| 5 | `[HEADER]` | 登入成功：從 auth-contract LoginRs 取出 `accessToken`，設入 `Authorization: Bearer {token}`；同時從 LoginRs 組裝身份 header 注入下游（見 Header Forwarding） | — |
 | 6 | `[KAFKA]` | Publish `operation-log.auth.login` event（非同步，失敗不影響主流程） | 記錄錯誤 log，不拋出例外 |
 | 7 | `[RETURN]` | `LoginAssembler.toLoginRs(authRs)` 組裝 BFF LoginRs（不含 accessToken）回傳 | — |
+
+### Header Forwarding
+
+登入成功後，BFF 從 auth-contract LoginRs 取出身份資料，注入為 Response Header 供後續請求使用。  
+下游 service 透過 `MemberContextFilter`（`common-biz` 自動配置）從 header 取得身份資料，無需自行解析。
+
+| Header | 來源欄位 | 說明 |
+|--------|----------|------|
+| `X-Member-Id` | `LoginRs.memberId` | Snowflake ID（String） |
+| `X-Role` | `LoginRs.role` | MEMBER / ADMIN |
+| `X-Name` | `LoginRs.name` | 顯示名稱 |
+
+> **注意：** 這三個 header 是 BFF 在每次通過驗證的請求中注入的，不僅限於 login。login 是建立 Session 的時機，header forwarding 是所有後續 API 的共通機制，詳見 `spec/common-biz/member-context.md`。
 
 ### Rate Limit 設計
 

@@ -14,6 +14,8 @@
 `accessToken` 包含在 Response 內回傳給 BFF，由 BFF 設入 Response Header，不直接暴露給 Client。  
 auth-service 不感知 Rate Limit，所有頻率控制由 BFF 負責。
 
+後續所有需要身份資料的 API，auth-service 透過 `MemberContextFilter`（`common-biz` 自動配置）從 BFF 注入的 `X-Member-Id`、`X-Role`、`X-Name` header 取得，無需自行解析或查詢 Redis。詳見 `spec/common-biz/member-context.md`。
+
 ---
 
 ## 2. API Definition — auth-service

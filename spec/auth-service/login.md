@@ -14,6 +14,8 @@ Sequentially queries the member record, verifies the password, issues a JWT, and
 The `accessToken` is included in the Response and returned to the BFF, which sets it into the Response Header. It is never directly exposed to the client.  
 auth-service has no awareness of rate limiting — all frequency control is the BFF's responsibility.
 
+For all subsequent APIs that require identity data, auth-service reads from the `X-Member-Id`, `X-Role`, and `X-Name` headers injected by the BFF, via `MemberContextFilter` (auto-configured by `common-biz`). No manual header parsing or Redis access is required. See `spec/common-biz/member-context.md`.
+
 ---
 
 ## 2. API Definition — auth-service
