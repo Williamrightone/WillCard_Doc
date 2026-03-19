@@ -28,6 +28,7 @@ This chapter describes the system architecture of WillCard, including the archit
 | 7 | Ledger Service | Core | Double-entry ledger, journal entries, immutable |
 | 8 | Reconciliation Service | Core | T+0 real-time reconciliation, T+1 batch settlement, discrepancy reports |
 | 9 | Notification Service | Infra | OTP SMS, transaction push notifications, email receipts |
+| 10 | Auth Service | Domain | Login, Oauth, user authentication and authrozation |
 
 > **FX Service positioning:**
 > FX Service is a stateless exchange rate utility. It holds no accounts and participates in no Saga state management. Its sole responsibility is rate query, locking, and conversion calculation.

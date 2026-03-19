@@ -153,8 +153,8 @@ LoginRq
 bff
 ├── application
 │     ├── api
-│     │     └── dto                  # Rq / Rs (BFF-only)
-│     ├── controller                 # Controller
+│     │     ├── controller           # Controller
+│     │     └── dto                  # Rq / Rs（BFF only）
 │     ├── usecase                    # Use Case interfaces
 │     ├── usecase.impl               # Use Case implementations
 │     └── usecase.assembler          # Assemblers for large Use Cases
@@ -166,7 +166,6 @@ bff
 │     ├── service                    # Domain Service interfaces
 │     └── service.impl               # Domain Service implementations (selective)
 ├── adapter
-│     ├── persistence                # JPA RepositoryImpl, Entity
 │     ├── client                     # FeignClient implementing Port
 │     └── messaging                  # Kafka / RabbitMQ Publisher implementing Port
 └── bootstrap                        # Spring Boot entry point, ControllerAdvice

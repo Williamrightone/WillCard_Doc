@@ -155,8 +155,8 @@ LoginRq
 bff
 ├── application
 │     ├── api
+│     │     ├── controller           # Controller
 │     │     └── dto                  # Rq / Rs（BFF 專屬）
-│     ├── controller                 # Controller
 │     ├── usecase                    # Use Case 介面
 │     ├── usecase.impl               # Use Case 實作
 │     └── usecase.assembler          # 大型 Use Case 的 Assembler
@@ -168,7 +168,6 @@ bff
 │     ├── service                    # Domain Service 介面
 │     └── service.impl               # Domain Service 實作（選擇性）
 ├── adapter
-│     ├── persistence                # JPA RepositoryImpl、Entity
 │     ├── client                     # FeignClient 實作 Port
 │     └── messaging                  # Kafka / RabbitMQ Publisher 實作 Port
 └── bootstrap                        # Spring Boot 入口點、ControllerAdvice

@@ -28,6 +28,7 @@
 | 7 | Ledger Service | Core | Double-entry 帳本、journal entries、不可變 |
 | 8 | Reconciliation Service | Core | T+0 即時對帳、T+1 批次清算、差異報表 |
 | 9 | Notification Service | Infra | OTP SMS、交易推播、Email receipt |
+| 10 | Auth Service | Domain | Login, Oauth, 用戶授權與認證 |
 
 > **FX Service 定位說明：**
 > FX Service 是無狀態的匯率計算工具，不持有任何帳戶，不參與 Saga 狀態管理。職責僅限於匯率資料的查詢、鎖定與換算計算，歸類為 Utility Service 而非 Domain Service.
