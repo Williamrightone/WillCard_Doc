@@ -91,17 +91,62 @@ Token 回傳至 BFF，不直接暴露給 Client。
 
 | 等級 | 定義 | Log 行為 |
 |------|------|----------|
-| L1 | 涉及金流、身份驗證、安全操作 | BFF publish Kafka event → Audit Consumer 寫 DB |
-| L2 | 資料變更（非金流） | BFF publish Kafka event → Audit Consumer 寫 DB |
+| L1 | 涉及金流、身份驗證、安全操作 | BFF publish Kafka event → Reconciliation Service（Audit Consumer）寫 DB |
+| L2 | 資料變更（非金流） | BFF publish Kafka event → Reconciliation Service（Audit Consumer）寫 DB |
 | L3 | 一般查詢 | 只寫 EFK，不進 Kafka，不入 DB |
+
+**Event Class：** `OperationLogEvent`（定義於 `common-shared`）是所有 L1/L2 Kafka event 的標準 payload。
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| service | String | 發送方識別，如 `bff` |
+| action | String | 點分命名，如 `auth.login`、`wallet.top-up` |
+| userId | String | Snowflake ID；無法取得時為 null（如 pre-auth 失敗） |
+| userAccount | String | 登入帳號 |
+| ip | String | Client IP |
+| result | String | `SUCCESS` / `FAIL` |
+| failReason | String | 失敗描述；成功時為 null |
+| errorCode | String | 失敗時的內部錯誤碼；成功時為 null |
+| beforeSnapshot | String | 操作前狀態，序列化 JSON；Auth/讀取操作填 null |
+| afterSnapshot | String | 操作後狀態，序列化 JSON；Auth/讀取操作填 null |
+| requestId | String | HTTP correlation ID |
+| txnId | String | 關聯交易 Snowflake ID；非金流操作填 null |
+| timestamp | Long | 事件發生時間（epoch millis） |
+
+> ⚠️ **PCI DSS：** `beforeSnapshot` / `afterSnapshot` 中絕對不能出現 CVV、明文 PAN 或密碼。序列化前必須先過濾敏感欄位。
+
+**Publish 觸發設計：** 同一個 API 可能在 UseCase Flow 的多個節點發送 event——每一條失敗路徑與成功路徑各自發送一次。`[KAFKA]` 步驟必須標注屬於失敗路徑或成功路徑。
+
+每份 BFF spec 須聲明 event 欄位對應，並列出所有觸發情境：
 
 ```markdown
 ## Operation Log Level
 
-**等級：L1**  
-觸發時機：每次呼叫 login API，無論成功或失敗皆須記錄。  
-Kafka Topic：`operation-log.auth.login`  
-儲存欄位：userId（失敗時為 null）、userAccount、result（SUCCESS / FAIL）、failReason、ip、timestamp
+**等級：L1**
+**觸發時機：** 每次呼叫，無論成功或失敗皆須記錄。
+**Kafka Topic：** `operation-log.auth.login`
+
+| OperationLogEvent 欄位 | 值來源 |
+|------------------------|--------|
+| service | `bff` |
+| action | `auth.login` |
+| userId | `LoginRs.memberId`（失敗時為 null） |
+| userAccount | `Request.account` |
+| ip | Client IP |
+| result | `SUCCESS` / `FAIL` |
+| failReason | 失敗描述；成功時為 null |
+| errorCode | 失敗錯誤碼；成功時為 null |
+| beforeSnapshot | — |
+| afterSnapshot | — |
+| requestId | HTTP correlation ID |
+| txnId | — |
+
+**Publish 觸發點：**
+| 情境 | result | failReason / errorCode |
+|------|--------|------------------------|
+| 帳號鎖定（Step 1） | FAIL | `ACCOUNT_LOCKED` / — |
+| 密碼驗證失敗（Step 5） | FAIL | 取自 auth-service errorCode |
+| 登入成功（Step 7） | SUCCESS | — |
 ```
 
 ---

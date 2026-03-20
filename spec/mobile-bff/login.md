@@ -17,18 +17,32 @@ The BFF does not perform password verification or token issuance — it is respo
 
 ## 2. Operation Log Level
 
-**Level: L1**  
-**Trigger:** Every call to the login API must be recorded, regardless of success or failure.  
+**Level: L1**
+**Trigger:** Every call, regardless of success or failure.
 **Kafka Topic:** `operation-log.auth.login`
 
-| Field | Type | Description |
-|-------|------|-------------|
-| memberId | BIGINT | Snowflake ID on success; null on failure |
-| account | VARCHAR | Login account |
-| result | ENUM | SUCCESS / FAIL |
-| failReason | VARCHAR | Failure reason; null on success |
-| ip | VARCHAR | Client IP address |
-| timestamp | DATETIME | Event occurrence time |
+| OperationLogEvent Field | Value Source |
+|------------------------|--------------|
+| service | `bff` |
+| action | `auth.login` |
+| userId | `LoginRs.memberId` (null on failure) |
+| userAccount | `Request.account` |
+| ip | Client IP |
+| result | `SUCCESS` / `FAIL` |
+| failReason | Error description on failure; null on success |
+| errorCode | Error code on failure; null on success |
+| beforeSnapshot | — |
+| afterSnapshot | — |
+| requestId | HTTP correlation ID |
+| txnId | — |
+
+**Publish Triggers:**
+
+| Scenario | result | failReason / errorCode |
+|----------|--------|------------------------|
+| Account locked (Step 1) | FAIL | `ACCOUNT_LOCKED` / — |
+| Credential failure (Step 5) | FAIL | From auth-service errorCode |
+| Login success (Step 7) | SUCCESS | — |
 
 ---
 
@@ -82,13 +96,14 @@ The BFF `LoginRq` (`application.api.dto`) and the auth-contract `LoginRq` (`auth
 
 | Step | Type | Description | Failure Handling |
 |------|------|-------------|------------------|
-| 1 | `[REDIS READ]` | Check if `login:lock:{account}` exists | Key exists → throw `ACCOUNT_LOCKED`, abort flow |
+| 1 | `[REDIS READ]` | Check if `login:lock:{account}` exists | Key exists → publish FAIL event (failReason=`ACCOUNT_LOCKED`, async) → throw `ACCOUNT_LOCKED`, abort flow |
 | 2 | `[VALIDATE]` | `LoginAssembler.toAuthRq(rq)` converts BFF LoginRq to auth-contract LoginRq | — |
 | 3 | `[FEIGN]` | `AuthClientAdapter` calls auth-service → [auth-service/login.en.md](../auth-service/login.en.md) | Business error → proceed to step 4; system error → throw `INTERNAL_ERROR` |
-| 4 | `[REDIS WRITE]` | On login failure: increment `login:attempt:{account}`, TTL 1200s; write `login:lock:{account}` when count reaches 3, TTL 1200s | — |
-| 5 | `[HEADER]` | On login success: extract `accessToken` from auth-contract LoginRs, set `Authorization: Bearer {token}`; assemble identity headers from LoginRs and inject downstream (see Header Forwarding) | — |
-| 6 | `[KAFKA]` | Publish `operation-log.auth.login` event (async — failure does not affect main flow) | Log the error, do not throw exception |
-| 7 | `[RETURN]` | `LoginAssembler.toLoginRs(authRs)` assembles BFF LoginRs (without accessToken) and returns | — |
+| 4 | `[REDIS WRITE]` | **[On failure]** Increment `login:attempt:{account}`, TTL 1200s; write `login:lock:{account}` when count reaches 3, TTL 1200s | — |
+| 5 | `[KAFKA]` | **[On failure]** Publish FAIL event (errorCode from auth-service, async) → throw `INVALID_CREDENTIALS` | Log the error, do not throw exception |
+| 6 | `[HEADER]` | **[On success]** Extract `accessToken` from auth-contract LoginRs, set `Authorization: Bearer {token}`; assemble identity headers (see Header Forwarding) | — |
+| 7 | `[KAFKA]` | **[On success]** Publish SUCCESS event (async) | Log the error, do not throw exception |
+| 8 | `[RETURN]` | `LoginAssembler.toLoginRs(authRs)` assembles BFF LoginRs (without accessToken) and returns | — |
 
 ### Header Forwarding
 

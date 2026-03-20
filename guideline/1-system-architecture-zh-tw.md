@@ -26,7 +26,7 @@
 | 5 | FX Service | Utility | 匯率查詢、鎖定匯率（無狀態計算工具，不持有帳戶） |
 | 6 | Transaction Orchestrator | Core | Saga 協調、補償交易、冪等控制 |
 | 7 | Ledger Service | Core | Double-entry 帳本、journal entries、不可變 |
-| 8 | Reconciliation Service | Core | T+0 即時對帳、T+1 批次清算、差異報表 |
+| 8 | Reconciliation Service | Core | T+0 即時對帳、T+1 批次清算、差異報表；Operation Log 稽核消費者（Kafka → DB） |
 | 9 | Notification Service | Infra | OTP SMS、交易推播、Email receipt |
 | 10 | Auth Service | Domain | Login, Oauth, 用戶授權與認證 |
 
@@ -45,6 +45,10 @@ graph TB
         BFF[BFF<br/>JWT 驗證 · 速率限制 · 冪等控制<br/>Header 轉發]
     end
 
+    subgraph Auth_Layer["身份驗證"]
+        AUTH[Auth Service<br/>Login · OAuth · 身份認證與授權]
+    end
+
     subgraph Domain_Layer["領域服務（信任 BFF Header — 不啟用 Security filter）"]
         CARD[Card Service<br/>虛擬卡 · OTP · combineKey]
         WALLET[Wallet Service<br/>餘額 · 儲值]
@@ -58,7 +62,7 @@ graph TB
     subgraph Core_Layer["核心引擎"]
         ORCH[Transaction Orchestrator<br/>Saga · 補償交易 · 冪等控制]
         LEDGER[Ledger Service<br/>複式記帳 · 不可變]
-        RECON[Reconciliation<br/>T+0 · T+1 批次]
+        RECON[Reconciliation<br/>T+0 · T+1 批次 · 稽核日誌]
     end
 
     subgraph Event_Bus["Kafka 事件匯流排"]
@@ -74,6 +78,7 @@ graph TB
     WA --> BFF
     POS --> BFF
 
+    BFF -->|Feign| AUTH
     BFF -->|X-User-Id, X-User-Role header| CARD
     BFF -->|X-User-Id, X-User-Role header| WALLET
     BFF -->|X-User-Id, X-User-Role header| POINTS

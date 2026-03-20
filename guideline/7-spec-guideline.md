@@ -92,17 +92,62 @@ Declare the Operation Log level for this API, along with its trigger condition a
 
 | Level | Definition | Log Behavior |
 |-------|------------|--------------|
-| L1 | Financial, authentication, or security operations | BFF publishes Kafka event → Audit Consumer writes to DB |
-| L2 | Non-financial data mutations | BFF publishes Kafka event → Audit Consumer writes to DB |
+| L1 | Financial, authentication, or security operations | BFF publishes Kafka event → Reconciliation Service (Audit Consumer) writes to DB |
+| L2 | Non-financial data mutations | BFF publishes Kafka event → Reconciliation Service (Audit Consumer) writes to DB |
 | L3 | General read queries | EFK only — no Kafka, no DB write |
+
+**Event Class:** `OperationLogEvent` (defined in `common-shared`) is the standard payload for all L1/L2 Kafka events.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| service | String | Publisher identity, e.g. `bff` |
+| action | String | Dot-notation name, e.g. `auth.login`, `wallet.top-up` |
+| userId | String | Snowflake ID; null when unavailable (e.g. pre-auth failure) |
+| userAccount | String | Login account |
+| ip | String | Client IP |
+| result | String | `SUCCESS` / `FAIL` |
+| failReason | String | Failure description; null on success |
+| errorCode | String | Internal error code on failure; null on success |
+| beforeSnapshot | String | Pre-operation state as JSON; null for auth/read ops |
+| afterSnapshot | String | Post-operation state as JSON; null for auth/read ops |
+| requestId | String | HTTP request correlation ID |
+| txnId | String | Related transaction Snowflake ID; null for non-financial ops |
+| timestamp | Long | Event time (epoch millis) |
+
+> ⚠️ **PCI DSS:** `beforeSnapshot` / `afterSnapshot` must never contain CVV, plain-text PAN, or passwords. Strip sensitive fields before serializing.
+
+**Publish Trigger Design:** An API may publish at multiple points in the UseCase Flow — separately for each failure path and the success path. `[KAFKA]` steps must annotate whether they occur on the failure or success path.
+
+In each BFF spec, declare the event field mapping and list all publish trigger scenarios:
 
 ```markdown
 ## Operation Log Level
 
 **Level: L1**
-Trigger: Every call to the login API must be recorded, regardless of success or failure.
-Kafka Topic: `operation-log.auth.login`
-Stored Fields: userId (null on failure), userAccount, result (SUCCESS / FAIL), failReason, ip, timestamp
+**Trigger:** Every call, regardless of success or failure.
+**Kafka Topic:** `operation-log.auth.login`
+
+| OperationLogEvent Field | Value Source |
+|------------------------|--------------|
+| service | `bff` |
+| action | `auth.login` |
+| userId | `LoginRs.memberId` (null on failure) |
+| userAccount | `Request.account` |
+| ip | Client IP |
+| result | `SUCCESS` / `FAIL` |
+| failReason | Error description on failure; null on success |
+| errorCode | Error code on failure; null on success |
+| beforeSnapshot | — |
+| afterSnapshot | — |
+| requestId | HTTP correlation ID |
+| txnId | — |
+
+**Publish Triggers:**
+| Scenario | result | failReason / errorCode |
+|----------|--------|------------------------|
+| Account locked (Step 1) | FAIL | `ACCOUNT_LOCKED` / — |
+| Credential failure (Step 5) | FAIL | From auth-service errorCode |
+| Login success (Step 7) | SUCCESS | — |
 ```
 
 ---

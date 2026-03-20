@@ -26,9 +26,9 @@ This chapter describes the system architecture of WillCard, including the archit
 | 5 | FX Service | Utility | Exchange rate query and locking (stateless calculator — no account ownership) |
 | 6 | Transaction Orchestrator | Core | Saga coordination, compensating transactions, idempotency control |
 | 7 | Ledger Service | Core | Double-entry ledger, journal entries, immutable |
-| 8 | Reconciliation Service | Core | T+0 real-time reconciliation, T+1 batch settlement, discrepancy reports |
+| 8 | Reconciliation Service | Core | T+0 real-time reconciliation, T+1 batch settlement, discrepancy reports; Operation Log audit consumer (Kafka → DB) |
 | 9 | Notification Service | Infra | OTP SMS, transaction push notifications, email receipts |
-| 10 | Auth Service | Domain | Login, Oauth, user authentication and authrozation |
+| 10 | Auth Service | Domain | Login, OAuth, user authentication and authorization |
 
 > **FX Service positioning:**
 > FX Service is a stateless exchange rate utility. It holds no accounts and participates in no Saga state management. Its sole responsibility is rate query, locking, and conversion calculation.
@@ -45,6 +45,10 @@ graph TB
         BFF[BFF<br/>JWT Validation · Rate Limit · Idempotency<br/>Header Forwarding]
     end
 
+    subgraph Auth_Layer["Authentication"]
+        AUTH[Auth Service<br/>Login · OAuth · Authentication]
+    end
+
     subgraph Domain_Layer["Domain Services (trust BFF headers — no Security filter)"]
         CARD[Card Service<br/>vCard · OTP · combineKey]
         WALLET[Wallet Service<br/>Balance · Top-up]
@@ -58,7 +62,7 @@ graph TB
     subgraph Core_Layer["Core Engine"]
         ORCH[Transaction Orchestrator<br/>Saga · Compensate · Idempotency]
         LEDGER[Ledger Service<br/>Double-entry · Immutable]
-        RECON[Reconciliation<br/>T+0 · T+1 Batch]
+        RECON[Reconciliation<br/>T+0 · T+1 Batch · Audit Log]
     end
 
     subgraph Event_Bus["Kafka Event Bus"]
@@ -74,6 +78,7 @@ graph TB
     WA --> BFF
     POS --> BFF
 
+    BFF -->|Feign| AUTH
     BFF -->|X-User-Id, X-User-Role header| CARD
     BFF -->|X-User-Id, X-User-Role header| WALLET
     BFF -->|X-User-Id, X-User-Role header| POINTS

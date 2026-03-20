@@ -17,18 +17,32 @@ BFF 本身不執行密碼驗證，不簽發 Token，僅負責流程協調與 Hea
 
 ## 2. Operation Log Level
 
-**等級：L1**  
-**觸發時機：** 每次呼叫 login API，無論成功或失敗皆須記錄。  
+**等級：L1**
+**觸發時機：** 每次呼叫，無論成功或失敗皆須記錄。
 **Kafka Topic：** `operation-log.auth.login`
 
-| 儲存欄位 | 型別 | 說明 |
-|----------|------|------|
-| memberId | BIGINT | 登入成功時的 Snowflake ID；失敗時為 null |
-| account | VARCHAR | 登入帳號 |
-| result | ENUM | SUCCESS / FAIL |
-| failReason | VARCHAR | 失敗原因；成功時為 null |
-| ip | VARCHAR | Client IP |
-| timestamp | DATETIME | 事件發生時間 |
+| OperationLogEvent 欄位 | 值來源 |
+|------------------------|--------|
+| service | `bff` |
+| action | `auth.login` |
+| userId | `LoginRs.memberId`（失敗時為 null） |
+| userAccount | `Request.account` |
+| ip | Client IP |
+| result | `SUCCESS` / `FAIL` |
+| failReason | 失敗描述；成功時為 null |
+| errorCode | 失敗錯誤碼；成功時為 null |
+| beforeSnapshot | — |
+| afterSnapshot | — |
+| requestId | HTTP correlation ID |
+| txnId | — |
+
+**Publish 觸發點：**
+
+| 情境 | result | failReason / errorCode |
+|------|--------|------------------------|
+| 帳號鎖定（Step 1） | FAIL | `ACCOUNT_LOCKED` / — |
+| 密碼驗證失敗（Step 5） | FAIL | 取自 auth-service errorCode |
+| 登入成功（Step 7） | SUCCESS | — |
 
 ---
 
@@ -82,13 +96,14 @@ BFF 的 `LoginRq`（`application.api.dto`）與 auth-contract 的 `LoginRq`（`a
 
 | 步驟 | 類型 | 說明 | 失敗處理 |
 |------|------|------|----------|
-| 1 | `[REDIS READ]` | 檢查 `login:lock:{account}` 是否存在 | key 存在 → 拋出 `ACCOUNT_LOCKED`，中止流程 |
+| 1 | `[REDIS READ]` | 檢查 `login:lock:{account}` 是否存在 | key 存在 → publish FAIL event（failReason=`ACCOUNT_LOCKED`，非同步）→ 拋出 `ACCOUNT_LOCKED`，中止流程 |
 | 2 | `[VALIDATE]` | `LoginAssembler.toAuthRq(rq)` 將 BFF LoginRq 轉換為 auth-contract LoginRq | — |
 | 3 | `[FEIGN]` | `AuthClientAdapter` 呼叫 auth-service → [auth-service/login.md](../auth-service/login.md) | auth-service 回傳業務錯誤 → 執行步驟 4；系統錯誤 → 拋出 `INTERNAL_ERROR` |
-| 4 | `[REDIS WRITE]` | 登入失敗時：`login:attempt:{account}` 計數 +1，TTL 1200s；計數達 3 時，另寫入 `login:lock:{account}`，TTL 1200s | — |
-| 5 | `[HEADER]` | 登入成功：從 auth-contract LoginRs 取出 `accessToken`，設入 `Authorization: Bearer {token}`；同時從 LoginRs 組裝身份 header 注入下游（見 Header Forwarding） | — |
-| 6 | `[KAFKA]` | Publish `operation-log.auth.login` event（非同步，失敗不影響主流程） | 記錄錯誤 log，不拋出例外 |
-| 7 | `[RETURN]` | `LoginAssembler.toLoginRs(authRs)` 組裝 BFF LoginRs（不含 accessToken）回傳 | — |
+| 4 | `[REDIS WRITE]` | **【失敗路徑】** `login:attempt:{account}` 計數 +1，TTL 1200s；計數達 3 時寫入 `login:lock:{account}`，TTL 1200s | — |
+| 5 | `[KAFKA]` | **【失敗路徑】** Publish FAIL event（errorCode 取自 auth-service，非同步）→ 拋出 `INVALID_CREDENTIALS` | 記錄錯誤 log，不拋出例外 |
+| 6 | `[HEADER]` | **【成功路徑】** 從 auth-contract LoginRs 取出 `accessToken`，設入 `Authorization: Bearer {token}`；組裝身份 header 注入下游（見 Header Forwarding） | — |
+| 7 | `[KAFKA]` | **【成功路徑】** Publish SUCCESS event（非同步） | 記錄錯誤 log，不拋出例外 |
+| 8 | `[RETURN]` | `LoginAssembler.toLoginRs(authRs)` 組裝 BFF LoginRs（不含 accessToken）回傳 | — |
 
 ### Header Forwarding
 
