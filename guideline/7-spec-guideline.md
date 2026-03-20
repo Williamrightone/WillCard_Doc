@@ -517,3 +517,5 @@ When a BFF spec requires idempotency:
 2. Each biz spec → Verify contract definitions and DB design
 
 ---
+
+Next Chapter: [Unit Testing](/guideline/8-unit-test.md)

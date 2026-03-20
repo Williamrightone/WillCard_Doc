@@ -126,3 +126,5 @@ Kafka 事件中的持卡人資料欄位規範：
 > - 各 service 使用獨立 DB 帳號，不共用，最小權限原則
 > - 僅 card-service 有權存取 card 相關資料表，其他服務透過 API 呼叫
 > - K8s Secret 管理 DB 帳號密碼，不寫入程式碼或 config 檔
+
+下一章: [Spec 撰寫規範](/guideline/7-spec-guideline-zh-tw.md)

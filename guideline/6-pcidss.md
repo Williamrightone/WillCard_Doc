@@ -126,3 +126,5 @@ Cardholder data field rules for Kafka event payloads:
 > - Each service uses a dedicated DB account — no shared credentials; least-privilege principle applies
 > - Only card-service has direct access to card-related tables; all other services access card data via API calls
 > - DB credentials are managed via K8s Secrets — never hardcoded in source code or config files
+
+Next Chapter: [Spec Guideline](/guideline/7-spec-guideline.md)

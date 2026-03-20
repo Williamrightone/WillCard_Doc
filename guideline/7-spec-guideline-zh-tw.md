@@ -514,3 +514,5 @@ BFF 收到請求後：
 
 1. `bff/{feature}.md` → 全覽流程與職責邊界
 2. 各 biz spec → 確認 contract 定義與 DB 設計
+
+下一章: [單元測試規範](/guideline/8-unit-test-zh-tw.md)

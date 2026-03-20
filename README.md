@@ -42,4 +42,7 @@ The system settles exclusively in New Taiwan Dollar (TWD). All foreign currency 
 2. [Infrastructure Configuration](/guideline/2-infrastructure.md)
 3. [Project Architecture](/guideline/3-project-architecture-structure.md)
 4. [Data Management](/guideline/4-data-mgmt.md)
-5. [Exception](/guideline/5-exception.md)
+5. [Exception Handling](/guideline/5-exception.md)
+6. [PCI DSS Compliance](/guideline/6-pcidss.md)
+7. [Spec Guideline](/guideline/7-spec-guideline.md)
+8. [Unit Testing](/guideline/8-unit-test.md)
