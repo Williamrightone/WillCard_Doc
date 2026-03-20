@@ -344,7 +344,93 @@ Domain Service 內部實作細節不在 spec 範圍內，由 PG 自行決定。
 
 ---
 
-## 5. 快速檢查清單
+## 5. 冪等設計（Idempotency）
+
+### 5.1 適用範圍
+
+所有**產生副作用的金融操作** POST 請求（交易、儲值、兌換等）**必須**帶入 `Idempotency-Key` header。
+非金融或唯讀的 POST（如 login）不適用。
+
+### 5.2 機制
+
+前端生成 UUID v4，放入 `Idempotency-Key` request header。
+BFF 在執行業務邏輯前檢查 Redis：
+
+```
+前端生成 UUID v4 → 放入 Idempotency-Key header
+
+BFF 收到請求後：
+  1. SETNX  idempotency:{key}  →  { status: PROCESSING, createdAt }（短 TTL，如 30–60 秒）
+  2. 若 SETNX 失敗且 status = COMPLETED  → 直接回傳快取 response（不重複執行）
+  3. 若 SETNX 失敗且 status = PROCESSING  → 拋出 409 Conflict
+  4. 若 SETNX 成功                        → 執行業務邏輯
+  5. 執行成功 → 更新為 COMPLETED，快取 response（較長 TTL，如 24 小時）
+  6. 執行失敗 → 刪除 key（允許 client 用同一個 Idempotency-Key 重試）
+```
+
+> **SETNX（SET NX）** 確保原子性——同一時間只有一個請求能取得該 key，防止重複請求同時到達時的競態條件。
+
+### 5.3 Redis Key 與 Value
+
+| 項目 | 內容 |
+|------|------|
+| Key pattern | `idempotency:{Idempotency-Key}` |
+| PROCESSING TTL | 短（如 30–60 秒）——防止 server crash 後 key 永久鎖定 |
+| COMPLETED TTL | 較長（如 24 小時）——決定快取回應的重試窗口 |
+
+**Value 結構：**
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| status | String | `PROCESSING` / `COMPLETED` |
+| httpStatus | int | 快取回應的原始 HTTP status code |
+| responseBody | String | 序列化的回應 JSON |
+| createdAt | long | key 建立時間（epoch millis） |
+
+### 5.4 失敗處理
+
+| 場景 | 行為 |
+|------|------|
+| 業務邏輯成功 | 更新 status 為 `COMPLETED`，快取 response |
+| 業務邏輯失敗 | **刪除 key**——client 可用同一個 `Idempotency-Key` 重試 |
+| PROCESSING 狀態被另一請求命中 | 回傳 **409 Conflict** |
+| PROCESSING key 過期（TTL） | key 自動釋放——下一個請求重新開始 |
+
+### 5.5 Idempotency-Key vs txnRef
+
+| | `Idempotency-Key` | `txnRef` |
+|---|---|---|
+| 用途 | 防止 BFF 層 HTTP 重複請求 | OTP 兩步驟流程中 Saga 的 session 識別符 |
+| 產生方 | Client（UUID v4） | Server（`card-pay` 第一步產生） |
+| 作用範圍 | 單一 HTTP 請求 | 整個 Saga 生命週期（如 `card-pay` → `card-pay/confirm`） |
+| 儲存位置 | Redis（`idempotency:{key}`） | Saga orchestrator state |
+
+### 5.6 BFF Spec 撰寫指引
+
+當 BFF spec 需要冪等時：
+
+1. **API Definition** — 在 Request Header 表格中加入 `Idempotency-Key`：
+
+```markdown
+### Request Header
+| Header | 必填 | 說明 |
+|--------|------|------|
+| Idempotency-Key | ✅ | UUID v4，由前端生成 |
+```
+
+2. **BFF UseCase Flow** — 將冪等檢查作為第一個步驟：
+
+```markdown
+| 步驟 | 類型 | 說明 | 失敗處理 |
+|------|------|------|----------|
+| 1 | [REDIS WRITE] | SETNX idempotency:{Idempotency-Key}，標記 PROCESSING | key 已存在且 COMPLETED → 回傳快取；key 已存在且 PROCESSING → 拋出 409 |
+| ... | ... | （後續業務邏輯步驟） | ... |
+| N | [REDIS WRITE] | 更新 idempotency:{Idempotency-Key} 為 COMPLETED，快取 response | 業務失敗 → 刪除 key |
+```
+
+---
+
+## 6. 快速檢查清單
 
 ### BFF Spec
 
@@ -354,6 +440,7 @@ Domain Service 內部實作細節不在 spec 範圍內，由 PG 自行決定。
 - [ ] BFF UseCase Flow 每步驟有標籤與失敗處理
 - [ ] `[FEIGN]` 步驟已連結到對應的 biz spec
 - [ ] Error Codes 列出對外錯誤碼
+- [ ] 需要冪等的 API 已在 Request Header 宣告 `Idempotency-Key`，且 UseCase Flow 包含冪等檢查步驟
 
 ### Biz Spec
 
@@ -366,7 +453,7 @@ Domain Service 內部實作細節不在 spec 範圍內，由 PG 自行決定。
 
 ---
 
-## 6. 閱讀建議
+## 7. 閱讀建議
 
 **開發者（BFF）閱讀順序：**
 
