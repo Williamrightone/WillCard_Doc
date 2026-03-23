@@ -12,7 +12,7 @@
 
 ### `member`
 
-> **Source migration:** `V1__create_member_table.sql`
+> **Source migration:** `V0.0.1__create_member_table.sql`
 > **Last updated:** 2026-03
 
 ```sql
