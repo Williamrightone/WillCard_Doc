@@ -9,10 +9,10 @@
 
 ## 1. Overview
 
-Receives the username/password login request forwarded by the BFF via Feign.  
-Sequentially queries the member record, verifies the password, issues a JWT, and creates a Redis Session.  
-The `accessToken` is included in the Response and returned to the BFF, which sets it into the Response Header. It is never directly exposed to the client.  
-auth-service has no awareness of rate limiting — all frequency control is the BFF's responsibility.
+Receives the username/password login request forwarded by the BFF via Feign.
+Sequentially queries the member record, verifies the password, and issues a JWT.
+The `accessToken` is included in the Response and returned to the BFF, which sets it into the Response Header. It is never directly exposed to the client.
+auth-service is **stateless**: its sole responsibility is validating credentials and issuing a signed JWT. It has no awareness of rate limiting or session state — all frequency control and user session management are the BFF's responsibility.
 
 For all subsequent APIs that require identity data, auth-service reads from the `X-Member-Id`, `X-Role`, and `X-Name` headers injected by the BFF, via `MemberContextFilter` (auto-configured by `common-biz`). No manual header parsing or Redis access is required. See `spec/common-biz/member-context.md`.
 
@@ -50,43 +50,28 @@ For all subsequent APIs that require identity data, auth-service reads from the 
 
 | Field | Description |
 |-------|-------------|
-| jti | JWT ID (UUID) — used for Redis Session comparison |
+| jti | JWT ID (UUID) — unique identifier for this token issuance |
 | memberId | Snowflake ID |
 | account | Login account |
 | role | MEMBER / ADMIN |
-| exp | Expiry timestamp — aligned with Redis Session TTL (3600s) |
+| exp | Expiry timestamp (3600s from issuance) |
 
 ---
 
 ## 3. Service UseCase Flow
 
-**UseCase:** `LoginUseCase.login(LoginRq)`  
-**UseCase Impl:** `LoginUseCaseImpl`  
-**Repository:** `MemberRepository` (interface) → `MemberRepositoryImpl` (JPA)
+**UseCase:** `LoginUseCase.login(LoginRq)`
+**UseCase Impl:** `LoginUseCaseImpl`
+**Repository:** `MemberJpaRepository` (Spring Data JPA)
 
-| Step | Type | Description | Domain Service |
-|------|------|-------------|----------------|
-| 1 | `[DB READ]` | Query `card_member` by `account` | `MemberQueryService.findByAccount()` |
-| 2 | `[DOMAIN]` | Bcrypt-verify `passwd` against stored hash | `AuthService.verifyPassword()` |
-| 3 | `[DOMAIN]` | Generate JWT (payload: jti, memberId, account, role, exp) | `TokenService.generate()` |
-| 4 | `[REDIS WRITE]` | Write `usession:{memberId}`, TTL 3600s | `SessionService.createSession()` |
-| 5 | `[RETURN]` | Return LoginRs (including accessToken for BFF to set in header) | — |
+> **DataHelper convention:** For complex queries or operations spanning multiple tables, extract a dedicated `*DataHelper` class rather than expanding the service. Simple single-table queries like this one may call `MemberJpaRepository` directly from the service.
 
-### Redis Session Content
-
-**Key:** `usession:{memberId}`  
-**TTL:** 3600s (aligned with JWT exp)  
-**Value:**
-
-| Field | Description |
-|-------|-------------|
-| jti | JWT ID — used for token validity comparison, prevents stale token replay |
-| memberId | Snowflake ID |
-| account | Login account |
-| role | MEMBER / ADMIN |
-| loginAt | Session creation timestamp |
-
-> **Single Session Policy:** The Redis key is scoped per `memberId`. A new login overwrites the existing Session, automatically invalidating the previous `jti`.
+| Step | Type | Description |
+|------|------|-------------|
+| 1 | `[DB READ]` | Query `member` by `account` via `MemberJpaRepository` |
+| 2 | `[DOMAIN]` | Bcrypt-verify `passwd` against stored hash |
+| 3 | `[DOMAIN]` | Generate JWT (payload: jti, memberId, account, role, exp) |
+| 4 | `[RETURN]` | Return LoginRs (including accessToken for BFF to set in header) |
 
 ---
 
@@ -96,17 +81,11 @@ For all subsequent APIs that require identity data, auth-service reads from the 
 
 | Table | Operation | Description |
 |-------|-----------|-------------|
-| `card_member` | READ | Query member credentials and Bcrypt hash by `account` |
-
-### Redis
-
-| Key Pattern | Operation | TTL | Description |
-|-------------|-----------|-----|-------------|
-| `usession:{memberId}` | WRITE | 3600s | User Session — new login overwrites existing Session |
+| `member` | READ | Query member credentials and Bcrypt hash by `account` |
 
 ### Table Schema
 
-#### card_member
+#### member
 
 | Column | Type | Nullable | Default | Description |
 |--------|------|----------|---------|-------------|

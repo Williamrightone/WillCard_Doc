@@ -9,10 +9,10 @@
 
 ## 1. Overview
 
-接收 BFF 透過 Feign 轉發的帳號密碼登入請求。  
-依序查詢使用者、驗證密碼、簽發 JWT、建立 Redis Session。  
-`accessToken` 包含在 Response 內回傳給 BFF，由 BFF 設入 Response Header，不直接暴露給 Client。  
-auth-service 不感知 Rate Limit，所有頻率控制由 BFF 負責。
+接收 BFF 透過 Feign 轉發的帳號密碼登入請求。
+依序查詢使用者、驗證密碼、簽發 JWT。
+`accessToken` 包含在 Response 內回傳給 BFF，由 BFF 設入 Response Header，不直接暴露給 Client。
+auth-service 為**無狀態服務**：職責僅限於驗證帳密與簽發 JWT，不感知 Rate Limit，也不管理 Session。所有頻率控制與使用者 Session 管理由 BFF 負責。
 
 後續所有需要身份資料的 API，auth-service 透過 `MemberContextFilter`（`common-biz` 自動配置）從 BFF 注入的 `X-Member-Id`、`X-Role`、`X-Name` header 取得，無需自行解析或查詢 Redis。詳見 `spec/common-biz/member-context.md`。
 
@@ -50,43 +50,28 @@ auth-service 不感知 Rate Limit，所有頻率控制由 BFF 負責。
 
 | 欄位 | 說明 |
 |------|------|
-| jti | JWT ID，UUID，用於 Redis Session 比對 |
+| jti | JWT ID，UUID，本次 Token 簽發的唯一識別碼 |
 | memberId | Snowflake ID |
 | account | 登入帳號 |
 | role | MEMBER / ADMIN |
-| exp | 過期時間，與 Redis Session TTL 一致（3600s） |
+| exp | 過期時間（簽發後 3600s） |
 
 ---
 
 ## 3. Service UseCase Flow
 
-**UseCase：** `LoginUseCase.login(LoginRq)`  
-**UseCase Impl：** `LoginUseCaseImpl`  
-**Repository：** `MemberRepository`（interface）→ `MemberRepositoryImpl`（JPA）
+**UseCase：** `LoginUseCase.login(LoginRq)`
+**UseCase Impl：** `LoginUseCaseImpl`
+**Repository：** `MemberJpaRepository`（Spring Data JPA）
 
-| 步驟 | 類型 | 說明 | 負責的 Domain Service |
-|------|------|------|-----------------------|
-| 1 | `[DB READ]` | 依 `account` 查詢 `card_member` | `MemberQueryService.findByAccount()` |
-| 2 | `[DOMAIN]` | 驗證 `passwd` 與 DB 內 Bcrypt 雜湊值 | `AuthService.verifyPassword()` |
-| 3 | `[DOMAIN]` | 生成 JWT（payload 含 jti、memberId、account、role、exp） | `TokenService.generate()` |
-| 4 | `[REDIS WRITE]` | 寫入 `usession:{memberId}`，TTL 3600s | `SessionService.createSession()` |
-| 5 | `[RETURN]` | 回傳 LoginRs（含 accessToken，供 BFF 讀取後設入 header） | — |
+> **DataHelper 慣例：** 複雜 query 或跨多 table 的操作，應抽取獨立的 `*DataHelper` class，而非直接擴充 service。單一 table 的簡單查詢（如本例）可從 service 直接呼叫 `MemberJpaRepository`。
 
-### Redis Session 內容
-
-**Key：** `usession:{memberId}`  
-**TTL：** 3600s（與 JWT exp 一致）  
-**Value：**
-
-| 欄位 | 說明 |
-|------|------|
-| jti | JWT ID，用於 Token 合法性比對，防止舊 Token 重放 |
-| memberId | Snowflake ID |
-| account | 登入帳號 |
-| role | MEMBER / ADMIN |
-| loginAt | Session 建立時間 |
-
-> **單一 Session 策略：** Redis key 以 `memberId` 為單位，新登入會直接覆蓋舊 Session，舊 jti 自動失效。
+| 步驟 | 類型 | 說明 |
+|------|------|------|
+| 1 | `[DB READ]` | 透過 `MemberJpaRepository` 依 `account` 查詢 `member` |
+| 2 | `[DOMAIN]` | 驗證 `passwd` 與 DB 內 Bcrypt 雜湊值 |
+| 3 | `[DOMAIN]` | 生成 JWT（payload 含 jti、memberId、account、role、exp） |
+| 4 | `[RETURN]` | 回傳 LoginRs（含 accessToken，供 BFF 讀取後設入 header） |
 
 ---
 
@@ -96,17 +81,11 @@ auth-service 不感知 Rate Limit，所有頻率控制由 BFF 負責。
 
 | Table | 操作 | 說明 |
 |-------|------|------|
-| `card_member` | READ | 依 `account` 查詢會員資料與 Bcrypt 雜湊值 |
-
-### Redis
-
-| Key Pattern | 操作 | TTL | 說明 |
-|-------------|------|-----|------|
-| `usession:{memberId}` | WRITE | 3600s | 使用者 Session，新登入覆蓋舊 Session |
+| `member` | READ | 依 `account` 查詢會員資料與 Bcrypt 雜湊值 |
 
 ### Table Schema
 
-#### card_member
+#### member
 
 | 欄位 | 型別 | Nullable | 預設值 | 說明 |
 |------|------|----------|--------|------|
