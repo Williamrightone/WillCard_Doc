@@ -19,7 +19,7 @@
 CREATE TABLE `member` (
   `member_id`  BIGINT                        NOT NULL COMMENT 'PK, Snowflake ID (application-generated, no auto-increment)',
   `account`    VARCHAR(100)                  NOT NULL COMMENT 'Login account',
-  `passwd`     VARCHAR(255)                  NOT NULL COMMENT 'Bcrypt password hash',
+  `password_hash`     VARCHAR(255)                  NOT NULL COMMENT 'Bcrypt password hash',
   `name`       VARCHAR(100)                  NOT NULL COMMENT 'Display name',
   `role`       ENUM('MEMBER', 'ADMIN')       NOT NULL DEFAULT 'MEMBER' COMMENT 'User role',
   `status`     ENUM('ACTIVE', 'DISABLED')    NOT NULL DEFAULT 'ACTIVE' COMMENT 'Account status',

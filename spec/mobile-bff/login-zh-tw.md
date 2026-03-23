@@ -108,10 +108,10 @@ BFF 本身不執行密碼驗證，不簽發 Token，僅負責流程協調與 Hea
 | Header | 來源欄位 | 說明 |
 |--------|----------|------|
 | `X-Member-Id` | `LoginRs.memberId` | Snowflake ID（String） |
-| `X-Role` | `LoginRs.role` | MEMBER / ADMIN |
-| `X-Name` | `LoginRs.name` | 顯示名稱 |
+| `X-Member-Account` | `LoginRs.account` | 登入帳號 |
+| `X-Member-Role` | `LoginRs.role` | MEMBER / ADMIN |
 
-> **注意：** 這三個 header 是 BFF 在每次通過驗證的請求中注入的，不僅限於 login。login 是建立 Session 的時機，header forwarding 是所有後續 API 的共通機制，詳見 `spec/common-biz/member-context.md`。
+> **注意：** 這些 header 是 BFF 在每次通過驗證的請求中注入的，不僅限於 login。login 是建立 Session 的時機，header forwarding 是所有後續 API 的共通機制，詳見 `spec/common-biz/member-context.md`。
 
 ### Rate Limit 設計
 
@@ -133,6 +133,6 @@ BFF 本身不執行密碼驗證，不簽發 Token，僅負責流程協調與 Hea
 | HTTP Status | Error Code | 說明 | 觸發條件 |
 |-------------|------------|------|----------|
 | 400 | INVALID_REQUEST | 請求格式錯誤 | account 或 passwd 為空 |
-| 401 | INVALID_CREDENTIALS | 帳號或密碼錯誤 | auth-service 回傳驗證失敗 |
-| 403 | ACCOUNT_LOCKED | 帳號已鎖定 | `login:lock:{account}` key 存在 |
+| 400 | ACCOUNT_LOCKED | 帳號已鎖定 | `login:lock:{account}` key 存在 |
+| 400 | INVALID_CREDENTIALS | 帳號或密碼錯誤 | auth-service 回傳驗證失敗 |
 | 500 | INTERNAL_ERROR | 系統錯誤 | 非預期例外 |

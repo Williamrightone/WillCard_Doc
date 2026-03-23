@@ -108,10 +108,10 @@ Downstream services read these headers via `MemberContextFilter` (auto-configure
 | Header | Source Field | Description |
 |--------|--------------|-------------|
 | `X-Member-Id` | `LoginRs.memberId` | Snowflake ID (String) |
-| `X-Role` | `LoginRs.role` | MEMBER / ADMIN |
-| `X-Name` | `LoginRs.name` | Display name |
+| `X-Member-Account` | `LoginRs.account` | Login account |
+| `X-Member-Role` | `LoginRs.role` | MEMBER / ADMIN |
 
-> **Note:** These three headers are injected by the BFF on every authenticated request, not only during login. Login establishes the Session; header forwarding is the shared mechanism for all subsequent APIs. See `spec/common-biz/member-context.md`.
+> **Note:** These headers are injected by the BFF on every authenticated request, not only during login. Login establishes the Session; header forwarding is the shared mechanism for all subsequent APIs. See `spec/common-biz/member-context.md`.
 
 ### Rate Limit Design
 
@@ -133,6 +133,6 @@ Downstream services read these headers via `MemberContextFilter` (auto-configure
 | HTTP Status | Error Code | Description | Trigger Condition |
 |-------------|------------|-------------|-------------------|
 | 400 | INVALID_REQUEST | Malformed request | account or passwd is blank |
-| 401 | INVALID_CREDENTIALS | Invalid credentials | auth-service returned an authentication failure |
-| 403 | ACCOUNT_LOCKED | Account is locked | `login:lock:{account}` key exists |
+| 400 | ACCOUNT_LOCKED | Account is locked | `login:lock:{account}` key exists |
+| 400 | INVALID_CREDENTIALS | Invalid credentials | auth-service returned an authentication failure |
 | 500 | INTERNAL_ERROR | Unexpected system error | Unhandled exception |
