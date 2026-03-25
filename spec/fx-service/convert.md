@@ -56,11 +56,12 @@ A live rate strategy is used (no rate locking) — each call uses the current ca
 
 | Step | Type | Description | Failure Handling |
 |------|------|-------------|------------------|
-| 1 | `[DOMAIN]` | Validate that `fromCurrency` and `toCurrency` are supported | Unsupported currency → throw `UNSUPPORTED_CURRENCY` |
-| 2 | `[REDIS READ]` | Read `fx:rate:{fromCurrency}:{toCurrency}`; cache hit → proceed to step 4 | Cache miss → proceed to step 3 |
-| 3 | `[DOMAIN]` | Call `BotExchangeRateClient.fetchRate(fromCurrency, toCurrency)` for a live rate, write to Redis with TTL 10800s (`FxRateService.fetchAndCache()`) | Bank API failure → throw `RATE_UNAVAILABLE` |
-| 4 | `[DOMAIN]` | Calculate converted amount: `convertedAmount = amount × rate`, rounded to 2 decimal places (`FxCalculationService.convert()`) | Calculation error → throw `INTERNAL_ERROR` |
-| 5 | `[RETURN]` | Return FxConvertRs (originalAmount, fromCurrency, convertedAmount, toCurrency, rate, rateTimestamp) | — |
+| 1 | `[DOMAIN]` | Validate that `fromCurrency` and `toCurrency` are in the supported currency list (`CurrencyService.getCurrencies()`) | Unsupported currency → throw `UNSUPPORTED_CURRENCY` |
+| 2 | `[REDIS READ]` | Read `fx:raw-rates`; cache hit → proceed to step 4 | Cache miss → proceed to step 3 |
+| 3 | `[DOMAIN]` | Call `BotExchangeRateClient.fetchParsedData()` to fetch and parse the full BOT CSV; write the raw map to Redis via `FxRatePort.cacheRawRates()` (TTL 10800s) | Bank API failure or unexpected exception → throw `RATE_UNAVAILABLE` |
+| 4 | `[DOMAIN]` | Compute rate via `BotExchangeRateClient.computeRate(from, to, rawRates)` applying the calculation strategy in the get-rate spec §3.2 | Computation failure (e.g., missing currency in map) → throw `RATE_UNAVAILABLE` |
+| 5 | `[DOMAIN]` | Calculate converted amount: `convertedAmount = amount × rate`, rounded to 2 decimal places (`FxCalculationService.convert()`) | Calculation error → throw `INTERNAL_ERROR` |
+| 6 | `[RETURN]` | Return FxConvertRs (originalAmount, fromCurrency, convertedAmount, toCurrency, rate, rateTimestamp) | — |
 
 ---
 
@@ -72,22 +73,23 @@ A live rate strategy is used (no rate locking) — each call uses the current ca
 
 ### Redis
 
-| Key Pattern | Operation | TTL | Description |
-|-------------|-----------|-----|-------------|
-| `fx:rate:{fromCurrency}:{toCurrency}` | READ | — | Read cached rate for a specific currency pair |
+| Key | Operation | TTL | Description |
+|-----|-----------|-----|-------------|
+| `fx:raw-rates` | READ | — | Entire BOT raw rate map (all supported currencies), stored as one JSON blob |
 
-> **Rate cache writes are handled by the scheduled task (FX Rate Scheduler).** This API triggers an on-demand update via `FxRateService.fetchAndCache()` only on a cache miss.
-> Key example: `fx:rate:USD:TWD`
+> **Rate cache writes are handled by the scheduled task (FX Rate Scheduler).** This API triggers an on-demand update via `FxRatePort.cacheRawRates()` only on a cache miss.
 
-### Redis Value Structure (`fx:rate:{fromCurrency}:{toCurrency}`)
+### Redis Value Structure (`fx:raw-rates`)
+
+Stored as a JSON serialization of `Map<String, BotRateRow>`, where each key is the ISO 4217 currency code and the value is a `BotRateRow` object:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| fromCurrency | String | Source currency |
-| toCurrency | String | Target currency |
-| rate | String | Exchange rate (BigDecimal serialized as string) |
-| rateTimestamp | Long | External API rate update timestamp (epoch millis) |
-| cachedAt | Long | Cache write timestamp (epoch millis) |
+| `{currencyCode}` (map key) | String | Foreign currency code (e.g. `USD`, `JPY`) |
+| `spotBuy` | String | Spot Buy rate against TWD (BigDecimal serialized as string) |
+| `spotSell` | String | Spot Sell rate against TWD (BigDecimal serialized as string) |
+
+> See `get-rate` spec §5 for the full Redis value example.
 
 ---
 

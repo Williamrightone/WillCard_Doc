@@ -56,11 +56,12 @@ fx-service 為**無狀態 Utility Service**：不持有帳戶資料，不參與 
 
 | 步驟 | 類型 | 說明 | 失敗處理 |
 |------|------|------|----------|
-| 1 | `[DOMAIN]` | 驗證 `fromCurrency` 與 `toCurrency` 是否為系統支援幣別 | 不支援的幣別 → 拋出 `UNSUPPORTED_CURRENCY` |
-| 2 | `[REDIS READ]` | 讀取 `fx:rate:{fromCurrency}:{toCurrency}`；快取命中 → 進入步驟 4 | 快取未命中 → 進入步驟 3 |
-| 3 | `[DOMAIN]` | 呼叫 `BotExchangeRateClient.fetchRate(fromCurrency, toCurrency)` 取得即時匯率，寫入 Redis TTL 10800s（`FxRateService.fetchAndCache()`） | 銀行 API 呼叫失敗 → 拋出 `RATE_UNAVAILABLE` |
-| 4 | `[DOMAIN]` | 計算換算金額：`convertedAmount = amount × rate`，四捨五入至小數點後 2 位（`FxCalculationService.convert()`） | 計算異常 → 拋出 `INTERNAL_ERROR` |
-| 5 | `[RETURN]` | 回傳 FxConvertRs（originalAmount、fromCurrency、convertedAmount、toCurrency、rate、rateTimestamp） | — |
+| 1 | `[DOMAIN]` | 透過 `CurrencyService.getCurrencies()` 驗證 `fromCurrency` 與 `toCurrency` 是否為系統支援幣別 | 不支援的幣別 → 拋出 `UNSUPPORTED_CURRENCY` |
+| 2 | `[REDIS READ]` | 讀取 `fx:raw-rates`；快取命中 → 進入步驟 4 | 快取未命中 → 進入步驟 3 |
+| 3 | `[DOMAIN]` | 呼叫 `BotExchangeRateClient.fetchParsedData()` 取得完整原始匯率 Map；透過 `FxRatePort.cacheRawRates()` 寫入 Redis（TTL 10800s） | 銀行 API 呼叫失敗或非預期例外 → 拋出 `RATE_UNAVAILABLE` |
+| 4 | `[DOMAIN]` | 呼叫 `BotExchangeRateClient.computeRate(from, to, rawRates)`，依 get-rate spec §3.2 計算策略換算匯率 | 換算失敗（如幣別不在 Map 中）→ 拋出 `RATE_UNAVAILABLE` |
+| 5 | `[DOMAIN]` | 計算換算金額：`convertedAmount = amount × rate`，四捨五入至小數點後 2 位（`FxCalculationService.convert()`） | 計算異常 → 拋出 `INTERNAL_ERROR` |
+| 6 | `[RETURN]` | 回傳 FxConvertRs（originalAmount、fromCurrency、convertedAmount、toCurrency、rate、rateTimestamp） | — |
 
 ---
 
@@ -72,22 +73,23 @@ fx-service 為**無狀態 Utility Service**：不持有帳戶資料，不參與 
 
 ### Redis
 
-| Key Pattern | 操作 | TTL | 說明 |
-|-------------|------|-----|------|
-| `fx:rate:{fromCurrency}:{toCurrency}` | READ | — | 查詢特定幣別對的匯率快取 |
+| Key | 操作 | TTL | 說明 |
+|-----|------|-----|------|
+| `fx:raw-rates` | READ | — | 所有支援幣別的原始匯率 Map，整包存為一筆 JSON |
 
-> **匯率快取寫入由排程任務（FX Rate Scheduler）負責**，本 API 於快取未命中時透過 `FxRateService.fetchAndCache()` 觸發即時更新。
-> Key 範例：`fx:rate:USD:TWD`
+> **匯率快取寫入由排程任務（FX Rate Scheduler）負責**，本 API 於快取未命中時透過 `FxRatePort.cacheRawRates()` 觸發即時更新。
 
-### Redis Value 結構（`fx:rate:{fromCurrency}:{toCurrency}`）
+### Redis Value 結構（`fx:raw-rates`）
+
+儲存格式為 `Map<String, BotRateRow>` 的 JSON 序列化結果，Map Key 為幣別代碼（ISO 4217），Value 為 `BotRateRow` 物件：
 
 | 欄位 | 型別 | 說明 |
 |------|------|------|
-| fromCurrency | String | 來源幣別 |
-| toCurrency | String | 目標幣別 |
-| rate | String | 匯率（BigDecimal 序列化為字串） |
-| rateTimestamp | Long | 外部 API 匯率更新時間（epoch millis） |
-| cachedAt | Long | 快取寫入時間（epoch millis） |
+| `{幣別代碼}`（Map Key） | String | 外幣代碼（如 `USD`、`JPY`） |
+| `spotBuy` | String | 對 TWD 的即期買入匯率（BigDecimal 序列化為字串） |
+| `spotSell` | String | 對 TWD 的即期賣出匯率（BigDecimal 序列化為字串） |
+
+> 完整 Redis Value 範例請參閱 get-rate spec §5。
 
 ---
 

@@ -11,8 +11,7 @@
 
 Accepts source and target currency codes from the caller and returns the current exchange rate with a timestamp.
 
-Rate data is sourced from the **Bank of Taiwan (BOT) public CSV API** — no API key required. The system fetches all supported currency pair rates every 3 hours via a scheduled task and writes them to Redis in batch (TTL 10800s).
-On query, Redis cache is checked first; if the cache is missing (e.g., on first startup), the bank API is called in real time and the result is written to cache (**Cache-Aside fallback**).
+Rate data is sourced from the **Bank of Taiwan (BOT) public CSV API** — no API key required. The system fetches the full BOT CSV every 3 hours via a scheduled task, parses all supported currencies into a single raw rate map, and caches it as one JSON blob in Redis (key `fx:raw-rates`, TTL 10800s). On query, the raw map is read from Redis and the rate is computed at read time. If the cache is missing (e.g., on first startup), the bank API is called in real time and the result is written to cache (**Cache-Aside fallback**).
 
 fx-service is a **stateless Utility Service**: it holds no account data, does not participate in Saga state management, and performs no MySQL writes.
 BFF calls this API to display rates to users; Transaction Orchestrator calls this API to retrieve the live rate for settlement calculations.
@@ -48,7 +47,7 @@ BFF calls this API to display rates to users; Transaction Orchestrator calls thi
 | toCurrency | String | Target currency (ISO 4217) | |
 | rate | BigDecimal | Exchange rate (fromCurrency → toCurrency) | 10 decimal places |
 | rateSource | String | Rate data source identifier | Fixed value `BOT` (Bank of Taiwan) |
-| rateTimestamp | Long | Rate data timestamp (epoch millis) | Cache write time (BOT does not provide quote time; fetch time is used instead) |
+| rateTimestamp | Long | Rate data timestamp (epoch millis) | Rate computation time (BOT does not provide quote time; computation time is used instead) |
 | cachedAt | Long | Cache write timestamp (epoch millis) | Redis cache write time |
 
 ---
@@ -94,7 +93,7 @@ The BOT API uses **TWD as the base currency** (1 unit of foreign currency = N TW
 |----------|-------------|------------|-------------|
 | Foreign → TWD | Direct lookup | Spot Buy (index 3) | Bank "buys" foreign currency from cardholder; cardholder sells foreign currency for TWD |
 | TWD → Foreign | `1 / Spot Sell` | Spot Sell (index 4) | Bank "sells" foreign currency to cardholder; cardholder buys foreign currency |
-| Foreign → Foreign | Cross rate | Spot mid of both against TWD | `rate(A→B) = rate(A→TWD) / rate(B→TWD)` |
+| Foreign → Foreign | Cross rate via TWD mid | Spot mid of both against TWD | `rate(A→B) = mid(A→TWD) / mid(B→TWD)`, where `mid = (Spot Buy + Spot Sell) / 2` |
 
 > **Credit card settlement convention:** Cross-border transactions are settled using the **Spot Buy rate** (bank buying the cardholder's foreign currency).
 
@@ -104,9 +103,9 @@ The BOT API uses **TWD as the base currency** (1 unit of foreign currency = N TW
 |------|-------|
 | Component | `FxRateScheduler` (Spring `@Scheduled`) |
 | Schedule | Every 3 hours (`cron = "0 0 */3 * * *"`) |
-| Behavior | Calls BOT CSV API, parses all supported currencies in batch, writes each pair to Redis with TTL 10800s |
+| Behavior | Calls BOT CSV API, parses all supported currencies into a raw `Map<String, BotRateRow>`, writes the entire map as one JSON blob to Redis under key `fx:raw-rates` (TTL 10800s) |
 | On Startup | `@PostConstruct` triggers one immediate run to ensure Redis is pre-populated |
-| Failure Handling | If a single currency pair fails to parse, log an Error and continue with remaining pairs (do not abort the batch) |
+| Failure Handling | If a single currency row fails to parse (e.g., non-numeric field), log a warning and skip that row — the remaining currencies are still cached |
 
 ---
 
@@ -117,10 +116,11 @@ The BOT API uses **TWD as the base currency** (1 unit of foreign currency = N TW
 
 | Step | Type | Description | Failure Handling |
 |------|------|-------------|------------------|
-| 1 | `[DOMAIN]` | Validate that `fromCurrency` and `toCurrency` are supported; if both are the same, return `rate=1` directly | Unsupported currency → throw `UNSUPPORTED_CURRENCY` |
-| 2 | `[REDIS READ]` | Read `fx:rate:{fromCurrency}:{toCurrency}`; cache hit → proceed to step 4 | Cache miss → proceed to step 3 (Cache-Aside fallback) |
-| 3 | `[DOMAIN]` | Call `BotExchangeRateClient.fetchRate(fromCurrency, toCurrency)` for a live rate (parse CSV, apply calculation strategy), write to Redis with TTL 10800s (`FxRateService.fetchAndCache()`) | Bank API failure → throw `RATE_UNAVAILABLE` |
-| 4 | `[RETURN]` | Return FxRateRs (fromCurrency, toCurrency, rate, rateSource, rateTimestamp, cachedAt) | — |
+| 1 | `[DOMAIN]` | Validate that `fromCurrency` and `toCurrency` are in the supported currency list (`CurrencyService.getCurrencies()`); if both are the same, return `rate=1` directly | Unsupported currency → throw `UNSUPPORTED_CURRENCY` |
+| 2 | `[REDIS READ]` | Read `fx:raw-rates`; cache hit → proceed to step 4 | Cache miss → proceed to step 3 (Cache-Aside fallback) |
+| 3 | `[DOMAIN]` | Call `BotExchangeRateClient.fetchParsedData()` to fetch and parse the full BOT CSV; write the raw map to Redis via `FxRatePort.cacheRawRates()` (TTL 10800s) | Bank API failure or unexpected exception → throw `RATE_UNAVAILABLE` |
+| 4 | `[DOMAIN]` | Compute rate via `BotExchangeRateClient.computeRate(from, to, rawRates)` applying the calculation strategy in §3.2 | Computation failure (e.g., missing currency in map) → throw `RATE_UNAVAILABLE` |
+| 5 | `[RETURN]` | Return `FxRateRs` (fromCurrency, toCurrency, rate, rateSource=`BOT`, rateTimestamp, cachedAt) | — |
 
 ---
 
@@ -132,24 +132,30 @@ The BOT API uses **TWD as the base currency** (1 unit of foreign currency = N TW
 
 ### Redis
 
-| Key Pattern | Operation | TTL | Description |
-|-------------|-----------|-----|-------------|
-| `fx:rate:{fromCurrency}:{toCurrency}` | READ | 10800s | Read cached rate for a specific currency pair |
+| Key | Operation | TTL | Description |
+|-----|-----------|-----|-------------|
+| `fx:raw-rates` | READ / WRITE | 10800s | Entire BOT raw rate map (all supported currencies), stored as one JSON blob |
 
 > TTL 10800s = 3 hours, aligned with the scheduler cycle. TTL is reset on every scheduler write.
 > Cache-Aside fallback writes (step 3) also use 10800s TTL.
-> Key examples: `fx:rate:USD:TWD`, `fx:rate:JPY:TWD`
 
-### Redis Value Structure (`fx:rate:{fromCurrency}:{toCurrency}`)
+### Redis Value Structure (`fx:raw-rates`)
+
+Stored as a JSON serialization of `Map<String, BotRateRow>`, where each key is the ISO 4217 currency code and the value is a `BotRateRow` object:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| fromCurrency | String | Source currency (ISO 4217) |
-| toCurrency | String | Target currency (ISO 4217) |
-| rate | String | Exchange rate (BigDecimal serialized as string) |
-| rateSource | String | Data source, fixed value `BOT` |
-| rateTimestamp | Long | Rate fetch timestamp (epoch millis) |
-| cachedAt | Long | Cache write timestamp (epoch millis) |
+| `{currencyCode}` (map key) | String | Foreign currency code (e.g. `USD`, `JPY`) |
+| `spotBuy` | String | Spot Buy rate against TWD (BigDecimal serialized as string) |
+| `spotSell` | String | Spot Sell rate against TWD (BigDecimal serialized as string) |
+
+> **Example:**
+> ```json
+> {
+>   "USD": { "spotBuy": "31.56", "spotSell": "31.66" },
+>   "JPY": { "spotBuy": "0.2082", "spotSell": "0.2102" }
+> }
+> ```
 
 ---
 
@@ -158,5 +164,5 @@ The BOT API uses **TWD as the base currency** (1 unit of foreign currency = N TW
 | HTTP Status | Error Code | Description | Trigger |
 |-------------|------------|-------------|---------|
 | 400 | UNSUPPORTED_CURRENCY | Unsupported currency | `fromCurrency` or `toCurrency` not in supported currency list |
-| 503 | RATE_UNAVAILABLE | Rate data unavailable | No Redis cache and live BOT API call failed |
+| 503 | RATE_UNAVAILABLE | Rate data unavailable | No Redis cache and live BOT API call failed, or rate computation error |
 | 500 | INTERNAL_ERROR | System error | Unexpected exception |
