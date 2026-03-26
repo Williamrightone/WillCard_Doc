@@ -1,415 +1,214 @@
-# 信用卡交易流程討論稿 (dish.md)
+# 信用卡交易功能開發順序
 
-> **用途：** 業務邏輯討論草稿，已確認事項會同步更新至 `guideline/10-txn-flow.md`。
-> **對應功能：** `10-credit-card-txn`
-> **狀態：** QA 第一輪已確認完畢，guideline 已產出。退款流程另立獨立 spec。
+## Phase 1 — 卡片管理（Card Management）
 
----
+**目標：** 建立虛擬卡的完整生命週期管理，為授權流程打底
 
-## 一、整體交易架構概念
-
-信用卡交易在 WillCard 中是一個**兩步驟 Saga 流程**：
-
-```
-Step 1: card-pay（發起交易）
-  ├─ 點數優先扣抵 reserve
-  ├─ 外幣匯率鎖定（若為外幣交易）
-  ├─ 3DS OTP 請求
-  └─ 回傳 txnRef（Saga session identifier）
-
-Step 2: card-pay/confirm（OTP 驗證 + 正式授權）
-  ├─ OTP 驗證
-  ├─ Orchestrator Saga 執行
-  │     ├─ 卡片狀態驗證
-  │     ├─ encryptedCard 解密 → NCCC 授權
-  │     ├─ 點數確認扣除
-  │     └─ 帳本分錄寫入
-  └─ 非同步：回饋點數計算、對帳、通知
-```
+- [ ] Card Service DB schema（Flyway migration）
+  - `card`：cardId（Snowflake）、userId、pan_masked、card_type、status、expiry_date
+  - `card_type_limit`：card_type、single_txn_limit、daily_limit
+- [ ] 卡片 CRUD API（BFF + Card Service）
+  - 申請虛擬卡（PENDING → ACTIVE）
+  - 查詢卡片資訊
+  - 凍結 / 解凍
+- [ ] 卡片狀態機：`PENDING → ACTIVE → FROZEN → CANCELLED`
+  - JVM Heap-only，禁止序列化與落地
 
 ---
 
-## 二、參與角色與外部系統
+## Phase 2 — 點數折抵偏好設定（Points Preference）
 
-| 角色 | 說明 |
-|------|------|
-| **Client（App）** | 使用者手機 App，發起交易、輸入 OTP |
-| **BFF** | 唯一對外入口，JWT 驗證、冪等控制、Saga 發起 |
-| **NCCC（聯合信用卡處理中心）** | 台灣信用卡授權機構，負責 3DS 加密、轉發至 Visa/Mastercard |
-| **Card Service** | 虛擬卡管理、combineKey 解密、OTP 生成與驗證、卡片額度表 |
-| **Wallet Service** | 台幣點數餘額管理（Reserve / Confirm / Release）|
-| **Points Service** | 點數回饋計算、點數 Batch 帳戶、到期管理 |
-| **FX Service** | 外幣交易匯率鎖定（無狀態工具）|
-| **Transaction Orchestrator** | Saga 狀態機協調、補償交易 |
-| **Ledger Service** | 不可變複式帳本 |
-| **Notification Service** | OTP SMS、交易成功推播、Email receipt |
-| **Reconciliation Service** | T+0 即時對帳、T+1 批次清算、稽核日誌消費者 |
+**目標：** 建立點數折抵偏好設定，以及 Reserve-Confirm-Release 核心方法
+
+- [ ] Wallet Service DB schema（Flyway migration）
+  - `wallet_account`：userId、available_balance、reserved_balance
+  - `member_points_preference`：userId、points_first_enabled、max_points_per_txn
+- [ ] 偏好設定 API（BFF + Wallet Service）
+  - 查詢 / 更新偏好（points_first_enabled、max_points_per_txn）
+- [ ] Reserve / Confirm / Release 核心方法
+  - `reserve(userId, amount)` → reservationId
+  - `confirmDeduct(reservationId)` → reserved_balance 扣除
+  - `release(reservationId)` → 退回 available_balance
 
 ---
 
-## 三、前置條件
+## Phase 3 — 回饋方案設定（Reward Plan）
 
-1. 使用者已登入，BFF 持有有效 JWT
-2. 使用者已綁定信用卡（Card Service，狀態 `ACTIVE`，未過期）
-3. 未超過卡片類型對應的單筆 / 單日限額
-4. 商家已完成 onboarding（有 merchantId 與 MCC Code）
+**目標：** 建立 MCC → 回饋率映射，為授權流程中的點數回饋計算做準備
 
----
-
-## 四、點數優先扣抵邏輯（Points-First）
-
-### 4.1 換算規則（已確認）
-
-| 項目 | 規則 |
-|------|------|
-| 換算比例 | **1 點 = NT$1**（1:1） |
-| 最小折抵單位 | **NT$1**（即 1 點） |
-| 最大折抵比例 | **全額折抵**（可 100% 用點數付款） |
-
-### 4.2 折抵流程
-
-使用者在 App 輸入折抵點數（`pointsToUse`），系統計算：
-
-```
-刷卡金額 = 原始金額 - pointsToUse
-（pointsToUse ≤ 可用點數餘額，且 pointsToUse ≤ 原始金額）
-```
-
-範例：
-```
-原始金額：NT$100
-使用點數：34 點（= NT$34）
-實際刷卡：NT$66
-
-交易紀錄需同時記錄：
-  - points_used:    34
-  - card_amount:    66
-  - total_amount:   100
-```
-
-### 4.3 Reserve-Confirm-Release 機制
-
-```
-Step 1 card-pay：
-  Wallet Service.reserve(userId, 34點)
-  → 點數帳戶 available_balance -= 34，reserved_balance += 34
-  → Reserve 有效期與 OTP TTL 對齊（180 秒），TTL 到期視為自動 Release
-
-Step 2 card-pay/confirm（授權成功）：
-  Wallet Service.confirmDeduct(reservationId)
-  → reserved_balance -= 34（實際扣除）
-
-補償（OTP 失敗 / 授權失敗 / TTL 到期）：
-  Wallet Service.release(reservationId)
-  → reserved_balance -= 34，available_balance += 34
-```
-
-> **設計備注（Q4 可靠性）：** Redis TTL 到期後 OTP 失效，Reserve 的 DB 狀態若未即時清理，需考慮補償：
-> 建議 Reserve 記錄本身帶有 `expire_at`，Wallet Service 在查詢可用餘額時過濾已過期的 reserve（惰性清理），避免引入 scheduler 依賴。
+- [ ] Points Service DB schema（Flyway migration）
+  - `reward_plan`：plan_id、mcc_code、reward_rate、effective_from、effective_to
+  - `point_reward_batch`：batch_id、userId、source_txn_id、issued_amount、remaining_balance、status、expires_at
+- [ ] Flyway DML：初始 MCC 回饋率種子資料（含 `DEFAULT` fallback）
+- [ ] `ApplicationReadyEvent` 預載 `Map<mcc_code, rate>` 至記憶體；寫入時 cache invalidation
+- [ ] 回饋率查詢 Feign API（供 Card Service 呼叫）
 
 ---
 
-## 五、3DS 認證流程
+## Phase 4 — 匯率服務（FX Service）
 
-### 5.1 OTP 生命週期
+**目標：** 提供外幣交易所需的無狀態匯率查詢與鎖定
 
-| 項目 | 規則 |
-|------|------|
-| OTP 長度 | 6 位數 |
-| 有效期 | 180 秒 |
-| Redis Key | `otp:{txnRef}`（TTL 180s） |
-| 重試上限 | 3 次（計數存於 Redis `otp:attempt:{txnRef}`）|
-| 失敗達上限 | **此次 txnRef 作廢**，卡片狀態不受影響 |
-
-### 5.2 加解密規則
-
-詳見 `guideline/6-pcidss-zh-tw.md` §2.2。關鍵規則：
-
-- `encryptedCard` 由 NCCC 使用 combineKey 加密
-- 解密後明文**僅存 JVM Heap**，授權完成後立即清除
-- CVV **絕不**寫入任何持久化儲存
-- PAN 僅以遮罩格式 `****-****-****-1234` 記錄
+- [ ] 匯率來源（開發環境 mock 固定值；正式接外部 API）
+- [ ] `lockRate(currency)` → fxRateId（Redis TTL 10 分鐘）
+- [ ] `getRate(fxRateId)` → 取回鎖定匯率
+- [ ] 外幣計算邏輯驗證（twd_base、fx_fee 1.5%、回饋基數為 twd_base）
 
 ---
 
-## 六、完整交易 Saga 流程
+## Phase 5 — AES-256 / combineKey 加解密（3DS Encryption）
 
-### 6.1 Saga 發起（Step 1: card-pay）
+**目標：** 完成卡片資料加解密機制，確保 PCI DSS 合規
 
-```
-Client → BFF  POST /api/v1/card/pay
-  ├─ [VALIDATE] JWT、請求參數（amount > 0, cardId, merchantId, pointsToUse）
-  ├─ [REDIS WRITE] 冪等 SETNX idempotency:{Idempotency-Key} PROCESSING
-  ├─ [FEIGN → Wallet Service] reserve(userId, pointsToUse)（若 pointsToUse > 0）
-  │     └─ 失敗（點數不足）→ 回傳錯誤，前端需重新輸入折抵金額
-  ├─ [FEIGN → FX Service] lockRate(currency, amount)（若為外幣）→ 回傳 fxRateId
-  ├─ [FEIGN → Card Service] generateOtp(cardId) → 回傳 txnRef
-  ├─ [KAFKA L1] Publish operation-log.card.pay（INITIATED）
-  └─ [RETURN] { txnRef, cardAmount, pointsUsed, fxRateId? }
-```
+- [ ] AES-256 GCM 加解密實作
+  - `encryptedCard` 解密流程（以記憶體中的 combineKey 解密）
+  - 明文卡片資料僅存 JVM Heap，不序列化、不落地
+  - CVV 授權完成後立即丟棄
+- [ ] PAN 遮罩格式驗證（`****-****-****-1234`）
+- [ ] Mock 環境的 combineKey 固定值設定（供 Mock NCCC 加密使用）
+- [ ] Log sanitization：確認 PAN / CVV 不出現於任何 log
+- [ ] combineKey 基礎設施
+  - 從 KMS / 環境變數載入
+---
 
-### 6.2 Saga 確認（Step 2: card-pay/confirm）
+## Phase 6 — OTP 產生與 SMS 通知（Notification）
 
-```
-Client → BFF  POST /api/v1/card/pay/confirm
-  ├─ [VALIDATE] JWT、txnRef、otp
-  ├─ [REDIS WRITE] 冪等 SETNX idempotency:{Idempotency-Key} PROCESSING
-  ├─ [FEIGN → Card Service] verifyOtp(txnRef, otp)
-  │     └─ 失敗 → 補償 release(reservationId)，回傳 OTP_FAILED
-  │
-  ├─ [FEIGN → Transaction Orchestrator] authorize(txnRef, fxRateId?)
-  │     │
-  │     │  Orchestrator Saga 步驟：
-  │     ├─ S1. Card Service: validateCard(cardId) → 狀態 / 過期 / 限額
-  │     ├─ S2. Card Service: decryptAndAuthorize(encryptedCard)
-  │     ├─ S3. NCCC External: sendAuthRequest → 取得 authCode
-  │     │     └─ 失敗 → 補償 release(reservationId)，Saga = AUTH_FAILED
-  │     ├─ S4. Wallet Service: confirmDeduct(reservationId)（若有折抵）
-  │     ├─ S5. Ledger Service: recordJournalEntries(txnId, ...)
-  │     ├─ S6. Kafka: Publish txn.card.authorized
-  │     │     ├─ Points Service → 計算回饋點數（PENDING batch）
-  │     │     ├─ Reconciliation Service → T+0 對帳
-  │     │     └─ Notification Service → Push + Email
-  │     └─ Saga state = COMPLETED
-  │
-  ├─ [KAFKA L1] Publish operation-log.card.pay-confirm（SUCCESS / FAIL）
-  ├─ [REDIS WRITE] 更新 idempotency key = COMPLETED
-  └─ [RETURN] { txnId, authCode, totalAmount, cardAmount, pointsUsed, estimatedRewardPoints }
-```
+**目標：** 建立 OTP 生命週期，完成 SMS 下行通路
 
-### 6.3 Saga 補償表
-
-| 步驟 | 補償動作 | 觸發條件 |
-|------|---------|---------|
-| Reserve 點數 | `release(reservationId)` | OTP 失敗、授權失敗、OTP TTL 到期（惰性）|
-| 鎖定匯率 | FX Rate TTL 自動過期 | 無需主動補償 |
-| Ledger 分錄 | 不刪除；寫入 REVERSAL 反向分錄 | 退款流程（另立 spec）|
+- [ ] Notification Service — OTP SMS 範本 + RabbitMQ Consumer
+- [ ] Card Service — 6 位數 OTP 安全亂數產生
+- [ ] Redis OTP session：`otp:{challengeRef}`（TTL 180s）
+  - Payload：`{ txnDetails, pointsToUse, reservationId, fxRateId? }`
+- [ ] 手機號碼遮罩記錄（log 僅顯示 `09xx****xx`）
 
 ---
 
-## 七、點數回饋計算（已確認）
+## Phase 7 — Issuer Authorization API（Card Service 核心）
 
-### 7.1 計算規則
+**目標：** 實作 NCCC 直接呼叫的兩支授權端點，這是整個交易流程的核心
 
-```
-回饋點數 = floor(card_amount × reward_rate)
+### Phase 1：`POST /card/auth/authorize`
 
-範例：
-  card_amount = 60, reward_rate = 2%
-  60 × 0.02 = 1.2 → floor → 1 點
-```
+- [ ] 以記憶體 combineKey 解密 encryptedCard
+- [ ] 由 PAN 識別會員
+- [ ] 驗證卡片：ACTIVE、未過期
+- [ ] 檢查交易限額（single_txn_limit + 當日累計 daily_limit）
+- [ ] 讀取點數偏好 → 計算 pointsToUse（min 三值規則）
+- [ ] 驗證可用資金：wallet_balance - pointsToUse >= cardAmount
+- [ ] `Wallet Service.reserve(userId, pointsToUse)`
+- [ ] 外幣：`FX Service.lockRate()` → fxRateId
+- [ ] 產生 OTP → 發送至 RabbitMQ（Notification Service 消費）
+- [ ] 儲存 Redis pending auth（TTL 180s）
+- [ ] Response：`CHALLENGE_REQUIRED + challengeRef + pointsPreview` / `DECLINED`
 
-**規則：**
-- 回饋基數為**實際刷卡金額**（不含點數折抵部分）
-- 無條件捨去（floor），不四捨五入
-- 外幣交易以**換算後台幣金額**計算回饋
+### Phase 2：`POST /card/auth/verify-challenge`
 
-### 7.2 Reward Plan（MCC 對應回饋率）
-
-回饋率**存於 DB**，後台可動態設定。先建立 `reward_plan` 表，管理 UI 為後續功能。
-
-| 商家類別（MCC 範例）| 回饋率 | 說明 |
-|--------------------|--------|------|
-| 餐廳（5812, 5814）| 3% | 待業務確認初始值 |
-| 超商（5411）| 2% | |
-| 網購（5965, 5999）| 2% | |
-| 其他 | 1% | 預設回饋 |
-
-> **備注：** 初始 MCC 回饋率數值需業務確認後填入 DB 初始化腳本（Flyway DML）。
-
-### 7.3 點數 Batch 設計
-
-每次回饋產生一筆獨立 Batch，記錄可用餘額與到期時間：
-
-```
-point_reward_batch（Points Service DB）
-  batch_id         BIGINT PK (Snowflake)
-  user_id          BIGINT
-  source_txn_id    BIGINT    關聯交易
-  issued_amount    INT       發放點數
-  remaining_balance INT      可用餘額（折抵時遞減）
-  status           VARCHAR   PENDING / CONFIRMED / EXPIRED / CANCELLED
-  expires_at       DATETIME  發放日 + 1 年
-  created_at       DATETIME
-```
+- [ ] Redis key 不存在 → `DECLINED + SESSION_EXPIRED`
+- [ ] 驗證 OTP 值
+- [ ] OTP 正確 → `Wallet Service.confirmDeduct(reservationId)` → 分配 txnId → Publish Kafka `txn.card.authorized` → 清除 Redis key
+- [ ] OTP 錯誤 → 雙層計數器：
+  - `otp:attempt:{challengeRef}`（per-session，TTL 180s，上限 3 次 → 授權作廢）
+  - `otp:card:fail:{cardId}`（per-card，TTL 900s，上限 5 次 → 卡片鎖定 + Kafka `card.risk.otp-threshold-exceeded`）
+- [ ] Response：`APPROVED` / `DECLINED + OTP_FAILED` / `DECLINED + CARD_LOCKED` / `DECLINED + SESSION_EXPIRED`
 
 ---
 
-## 八、複式記帳（Double-Entry Bookkeeping）
+## Phase 8 — Mock NCCC Service（開發環境）
 
-### 8.1 帳戶結構（初稿，需會計師確認）
+**目標：** 模擬 NCCC 對 Issuer API 的呼叫，讓 App 可以完整端對端測試
 
-| 帳戶代碼 | 帳戶名稱 | 類型 | 說明 |
-|----------|---------|------|------|
-| `1001` | 應收帳款 | Asset | 持卡人消費授權金額 |
-| `2001` | 應付商家款 | Liability | 應付給商家的結算金額（含點數補貼）|
-| `2002` | 點數負債 | Liability | 已發放但未使用的回饋點數 |
-| `3001` | 手續費收入 | Revenue | Interchange fee / 商家手續費 |
-| `4001` | 回饋點數費用 | Expense | 發放回饋點數的成本 |
-| `5001` | 匯差損益 | Revenue/Expense | 外幣交易匯差 |
-
-### 8.2 分錄範例
-
-**情境一：純刷卡 NT$100（無折抵，回饋率 1%，手續費假設 3%）**
-
-| 借方 | 金額 | 貸方 | 金額 | 說明 |
-|------|------|------|------|------|
-| 應收帳款(1001) | 100 | 應付商家款(2001) | 97 | 刷卡授權 |
-|  | | 手續費收入(3001) | 3 | |
-| 回饋費用(4001) | 1 | 點數負債(2002) | 1 | 回饋 1 點 = NT$1 |
-
-**情境二：折抵 NT$34 + 刷卡 NT$66（原價 NT$100，回饋率 1%，手續費 3%）**
-
-| 借方 | 金額 | 貸方 | 金額 | 說明 |
-|------|------|------|------|------|
-| 應收帳款(1001) | 66 | 應付商家款(2001) | 64.02 | 刷卡部分 |
-|  | | 手續費收入(3001) | 1.98 | |
-| 點數負債(2002) | 34 | 應付商家款(2001) | 34 | WillCard 補貼商家差額 |
-| 回饋費用(4001) | 0 | 點數負債(2002) | 0 | floor(66 × 1%) = 0 點 |
-
-> **商家補貼確認：** 商家仍收到 NT$100，WillCard（與合作銀行）共同承擔 NT$34 的點數補貼成本。
-
-### 8.3 Journal Entry Schema（初稿）
-
-```
-journal_entry（Ledger Service DB）
-  entry_id        BIGINT PK (Snowflake)
-  txn_id          BIGINT
-  journal_type    VARCHAR(20)    AUTHORIZATION / SETTLEMENT / REVERSAL / REWARD
-  entry_type      VARCHAR(10)    DEBIT / CREDIT
-  account_code    VARCHAR(10)
-  amount          DECIMAL(15,4)
-  currency        VARCHAR(3)     TWD / USD / ...
-  fx_rate         DECIMAL(10,6)  台幣交易為 1.0
-  amount_twd      DECIMAL(15,4)  台幣換算金額
-  memo            VARCHAR(255)
-  created_at      DATETIME(3)    不可變，無 updated_at
-```
+- [ ] `POST /mock-nccc/pay`
+  - 接收 App 刷卡請求（cardId、amount、currency、merchantId）
+  - 用 mock combineKey 加密卡片資料 → 組成 encryptedCard
+  - Feign 呼叫 `POST /card/auth/authorize`
+  - 回傳 `challengeRef + pointsPreview` 給 App
+- [ ] `POST /mock-nccc/pay/confirm`
+  - 接收 App 的 OTP（challengeRef + otp）
+  - Feign 呼叫 `POST /card/auth/verify-challenge`
+  - 回傳最終結果（`APPROVED` / `DECLINED`）
 
 ---
 
-## 九、外幣交易處理（已確認）
+## Phase 9 — 交易 Saga（Transaction Orchestrator）
 
-| 項目 | 規則 |
-|------|------|
-| 外幣手續費 | **固定 1.5%**，加收於刷卡金額之上 |
-| 匯率來源 | 待確認（台銀牌告 / 第三方 API）→ 目前由 FX Service 管理 |
-| 匯率鎖定 | Step 1 呼叫 FX Service 鎖定，回傳 `fxRateId`（有效期 10 分鐘）|
-| 帳本記錄 | 以台幣記帳，附記原幣金額 + 匯率 |
-| 回饋計算 | 以換算後**台幣金額**計算（含手續費？待確認）|
+**目標：** 處理授權成功後的下游非同步流程，以及補償邏輯
 
-外幣刷卡計算範例：
-```
-原幣：USD$100
-匯率：31.0
-台幣等值：TWD$3,100
-外幣手續費（1.5%）：TWD$46.5
-實際扣款：TWD$3,146.5
-```
+- [ ] Kafka Consumer：`txn.card.authorized`
+- [ ] 下游觸發（非同步，依序或並行）：
+  - Ledger Service：寫入 AUTHORIZATION 複式分錄
+  - Points Service：建立 `point_reward_batch`（PENDING，T+1 清算後 CONFIRMED）
+  - Reconciliation：登記交易記錄
+  - Notification Service：推播 + Email receipt
+- [ ] 補償觸發：
+  - Phase 1 資金不足 / 驗卡失敗 → `Wallet Service.release(reservationId)`
+  - OTP 失敗 / Session 過期 → `Wallet Service.release(reservationId)`
+  - TTL 到期惰性清理 → `Wallet Service.release(reservationId)`
 
 ---
 
-## 十、交易限額設計（已確認）
+## Phase 10 — 複式帳本（Ledger Service）
 
-| 限制類型 | 預設值 | 說明 |
-|---------|--------|------|
-| 單筆上限 | NT$100,000 | 依卡片類型可覆蓋 |
-| 單日累計上限 | NT$200,000 | 依卡片類型可覆蓋 |
+**目標：** 不可變帳本分錄，支援稽核與 T+1 清算
 
-限額**依卡片類型設定**，需一張 `card_type_limit` 表：
-
-```
-card_type_limit（Card Service DB）
-  id                BIGINT PK
-  card_type         VARCHAR     STANDARD / GOLD / PLATINUM / ...
-  single_txn_limit  DECIMAL     單筆上限
-  daily_limit       DECIMAL     單日累計上限
-  currency          VARCHAR     TWD
-  updated_at        DATETIME
-```
+- [ ] `journal_entry` 表（Flyway migration；無 updated_at）
+- [ ] Kafka Consumer：`txn.card.authorized`
+- [ ] 三種情境分錄實作：
+  - 台幣、無折抵（1001/2001/3001/4001/2002）
+  - 台幣、點數折抵（多加 2002 → 2001 補貼特店）
+  - 外幣（額外加 3002 外幣手續費）
+- [ ] 冪等設計：`idempotency_key = {messageKey}_{entry_seq}`；duplicate key → ignore（不拋例外）
+- [ ] SETTLEMENT 分錄（T+1 批次：DR 2001 / CR 1002）
 
 ---
 
-## 十一、通知設計
+## Phase 11 — BFF Card Pay API
 
-| 時機 | 通知方式 | 內容摘要 |
-|------|---------|---------|
-| OTP 生成 | SMS | 「WillCard 驗證碼：{OTP}，3 分鐘內有效」 |
-| 授權成功 | App Push + Email | 商家、總金額、點數折抵、預計回饋點數 |
-| 授權失敗 | App Push | 失敗原因 |
+**目標：** 對 App 暴露完整刷卡入口，串接 Mock NCCC
 
----
-
-## 十二、Operation Log Level
-
-| API | Log Level | Kafka Topic |
-|-----|-----------|-------------|
-| card-pay（Step 1）| L1 | `operation-log.card.pay` |
-| card-pay/confirm（Step 2）| L1 | `operation-log.card.pay-confirm` |
+- [ ] `POST /api/v1/card/pay`（Nginx strip prefix → BFF `/card/pay`）
+  - JWT 驗證 + X-User-Id header
+  - 冪等控制（idempotency key）
+  - Feign 呼叫 `POST /mock-nccc/pay`
+  - Operation Log L1：Kafka topic `operation-log.card.pay`
+- [ ] `POST /api/v1/card/pay/confirm`（Nginx strip → BFF `/card/pay/confirm`）
+  - Feign 呼叫 `POST /mock-nccc/pay/confirm`
+  - Operation Log L1：Kafka topic `operation-log.card.pay-confirm`
+- [ ] Error mapping：Card Service 錯誤碼 → BFF 對外錯誤碼
 
 ---
 
-## 十三、已確認 QA 紀錄
+## Phase 12 — 整合測試（End-to-End）
 
-| # | 問題 | 答案 |
-|---|------|------|
-| Q1 | 點數換算比例 | 1:1（1 點 = NT$1），最小折抵 1 點，可全額折抵 |
-| Q2 | 點數 reserve 失敗行為 | 點數不足時回傳錯誤，使用者重新輸入折抵金額 |
-| Q3 | OTP 失敗鎖定範圍 | 鎖定此次 txnRef，卡片不受影響 |
-| Q4 | Saga 逾時清理 | TTL 到期即失效，Reserve 用惰性清理（expire_at 欄位）|
-| Q5 | MCC 回饋率設定 | 存 DB，後台可動態設定，管理 UI 另行開發 |
-| Q6 | 點數折抵部分計算回饋 | 不計算，回饋僅基於實際刷卡金額，floor 無條件捨去 |
-| Q7 | 回饋點數到期日 | 發放後 1 年，每批次獨立追蹤餘額與到期時間 |
-| Q8 | 商家結算 | 商家仍收全額，WillCard + 合作銀行承擔折抵差額 |
-| Q9 | 外幣交易 | 包含，固定 1.5% 手續費 |
-| Q10 | 退款流程 | 另立獨立 spec，此次不包含 |
-| Q11 | 交易限額 | 單筆 NT$100,000，單日 NT$200,000，依卡片類型可覆蓋 |
+**目標：** 驗證完整交易流程的所有路徑
+
+- [ ] 正常台幣刷卡（無折抵）：App → BFF → Mock NCCC → Card Service → Saga → Ledger
+- [ ] 點數折抵（points_first_enabled = true）
+- [ ] 外幣交易（USD，驗證 fx_fee 與回饋基數）
+- [ ] OTP 失敗 → 重試 → 第 3 次授權作廢（per-session）
+- [ ] 卡片鎖定（per-card 5 次 / 15 分鐘，Kafka risk event）
+- [ ] Session 過期（Redis TTL 180s）
+- [ ] 資金不足 DECLINED → Wallet reserve release 補償
+- [ ] Kafka 冪等驗證（Ledger duplicate key 處理）
+- [ ] Phase 2 收到已過期 challengeRef → SESSION_EXPIRED
 
 ---
 
-## 十四、後續待確認項目
-
-| # | 問題 | 狀態 | 說明 |
-|---|------|------|------|
-| P1 | 初始 MCC 回饋率數值 | ✅ 確認 | 存 DB，啟動時載入 Map，更新時刷新 cache；初始值由業務填入 Flyway DML |
-| P2 | 外幣回饋計算基數 | ✅ 確認 | 使用 `twd_base`（純匯率換算），不含 1.5% 手續費 |
-| P3 | 匯率來源 | ✅ 確認 | 由 FX Service 統一管理（台銀牌告 / 第三方 API 由 FX Service 決定）|
-| P4 | 帳本帳戶設計 | ✅ 確認 | 已設計，見 guideline §8.2；台幣不收手續費，外幣收 1.5% 手續費 |
-| P5 | 卡片類型清單 | ⏳ 延後 | Card Type 定義於 Card Service onboarding spec，後面再定義 |
-
 ---
 
-## 十五、架構修正紀錄（重要）
+## NCCC 3DS 流程參考（機密，不得外流）
 
-### 修正一：WillCard 是 Issuer，NCCC 呼叫 WillCard
-
-原始設計錯誤地將 WillCard 設計為主動呼叫 NCCC。
-實際上：NCCC 收到 Acquirer 轉來的交易後，主動呼叫 WillCard 的 Issuer Authorization API 詢問是否授權。
-
-**Card Service 對外暴露兩個端點（不透過 BFF）：**
-- `POST /card/auth/authorize` — NCCC 呼叫，驗卡 + 觸發 OTP
-- `POST /card/auth/verify-challenge` — NCCC 呼叫，驗 OTP + 最終授權決策
-
-### 修正二：OTP 觸發時機
-
-原始設計：App 主動發起 → 生成 OTP → 用戶確認 → 才去 NCCC 授權。
-正確設計：NCCC 先將交易送到 Issuer（Card Service）→ Card Service 判斷需要 3DS → 觸發 OTP → 用戶輸入 → Card Service 回傳授權結果給 NCCC。
-
-### 修正三：Mock NCCC 設計
-
-為了在 App 中測試完整流程，設計 Mock NCCC Service：
-- App → BFF → Mock NCCC → Card Service（走相同授權路徑）
-- Mock NCCC 扮演 NCCC 角色，不繞過授權邏輯
-
-### 修正四：Points-First 改為 Preference 驅動
-
-原始設計：App 每次輸入 `pointsToUse`。
-正確設計：會員在 App 設定「點數優先」偏好（`member_points_preference` table）。
-Card Service 收到授權請求時自動讀取偏好並計算 `pointsToUse`，回傳 `pointsPreview` 供 App 顯示（如 LinePay 樣式）。
-
----
-
-## 十六、禁止事項
-
-- **禁止在 dish.md 確認完成前產生 spec 文件**
-- 已產出 guideline：`guideline/10-txn-flow.md`、`guideline/10-txn-flow-zh-tw.md`
+1. 持卡人確認購物，使用信用卡付款
+2. 驗證封包(AReq)傳送國際組織 DS; DS 回覆 ACS Server 驗證的結果(ARes)
+3. 國際組織將 AReq 封包加上 DS 欄位後轉給 ACS Server; 驗證結果(ARes)回覆 DS
+4. 若驗證結果需要進行卡人身份確認，導轉到 ACS Server 進行 OTP 的驗證
+5. ACS Server 產生取得 OTP 的身份驗證畫面
+6. 持卡人由身份驗證畫面按下"取得動態密碼"按鈕
+7. 通知銀行傳送 OTP 給持卡人
+8. 銀行由 SMS Server 發送 OTP 密碼至持卡人手機
+9. 持卡人輸入由簡訊收到的 OTP 密碼
+10. ACS Server 將持卡人輸入的 OTP 密碼傳送給銀行驗證是否正確
+11. 銀行回覆 OTP 密碼驗證結果
+12. 若 OTP 驗證結果正確，ACS Server 產生 CAVV/AAV 後組成身份驗證的 RReq 封包，
+RReq 轉送給 DS
+13. 國際組織將 RReq 封包加上 DS 欄位後轉給 3DS Server
+14. ACS Server 經由轉址通知商店身份認證結果完成

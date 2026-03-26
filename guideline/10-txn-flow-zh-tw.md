@@ -83,13 +83,15 @@ NCCC → POST /card/auth/verify-challenge
 
   Card Service 執行步驟：
     1. 從 Redis 讀取 otp:{challengeRef} 的 pending auth 狀態
+       → key 不存在（session 過期 / 已作廢）：直接回傳 DECLINED + SESSION_EXPIRED
     2. 驗證 OTP 值
     3a. OTP 正確：
         → Wallet Service.confirmDeduct(reservationId)
         → 分配 txnId（Snowflake）
         → Publish txn.card.authorized Kafka event（非同步 Saga 啟動）
         → 清除 Redis key
-    3b. OTP 錯誤：        → 累加 otp:attempt:{challengeRef}（per-session）
+    3b. OTP 錯誤：
+        → 累加 otp:attempt:{challengeRef}（per-session）
         → 累加 otp:card:fail:{cardId}（per-card，TTL 900s）
         → 檢查閾值（見 §2.3）
 
@@ -99,6 +101,8 @@ NCCC → POST /card/auth/verify-challenge
     DECLINED  + OTP_FAILED + attemptsRemaining
   Response（卡片已鎖定）：
     DECLINED  + CARD_LOCKED
+  Response（session 過期）：
+    DECLINED  + SESSION_EXPIRED
 ```
 
 ### 2.3 OTP 失敗閾值
@@ -269,7 +273,7 @@ Phase 2 — APPROVED：
 
 | Saga 步驟 | 補償動作 | 觸發條件 |
 |-----------|---------|---------|
-| 點數 reserve | `release(reservationId)` | OTP 失敗、授權失敗、TTL 到期（惰性）|
+| 點數 reserve | `release(reservationId)` | Phase 1 資金不足 / 驗卡失敗、OTP 失敗、Session 過期、TTL 到期（惰性）|
 | 匯率鎖定 | FX Rate TTL 自動到期 | 無需主動補償 |
 | 帳本分錄 | 寫入 REVERSAL 反向分錄（不得刪除）| 退款流程（另立 spec）|
 
