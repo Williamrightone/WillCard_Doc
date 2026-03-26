@@ -4,15 +4,145 @@
 
 **目標：** 建立虛擬卡的完整生命週期管理，為授權流程打底
 
-- [ ] Card Service DB schema（Flyway migration）
-  - `card`：cardId（Snowflake）、userId、pan_masked、card_type、status、expiry_date
-  - `card_type_limit`：card_type、single_txn_limit、daily_limit
-- [ ] 卡片 CRUD API（BFF + Card Service）
-  - 申請虛擬卡（PENDING → ACTIVE）
-  - 查詢卡片資訊
-  - 凍結 / 解凍
-- [ ] 卡片狀態機：`PENDING → ACTIVE → FROZEN → CANCELLED`
-  - JVM Heap-only，禁止序列化與落地
+### 卡片種類（4 種）
+
+| card_type | 中文名稱 | 國內回饋 | 國外回饋 | 跨國手續費 | 單筆上限 | 單日累計上限 |
+|-----------|---------|---------|---------|-----------|---------|------------|
+| CLASSIC | WillCard 經典卡 | 1% | 0% | 1.5% | NT$100,000 | NT$200,000 |
+| OVERSEAS | WillCard 海外卡 | 0% | 5% | 1% | NT$100,000 | NT$200,000 |
+| PREMIUM | WillCard 貴賓卡 | 2% | 5% | 1% | NT$200,000 | NT$500,000 |
+| INFINITE | WillCard 無限卡 | 2% | 5% | 1% | 無上限 | 無上限 |
+
+> **回饋率三層疊加邏輯（Phase 7 計算時使用）：**
+> 1. `card_type_limit.domestic/overseas_reward_rate`：卡種基礎回饋（本 Phase 定義）
+> 2. `reward_plan`（Phase 3）：MCC 類別加成，可綁定特定卡種（`card_type` nullable）或全卡種
+> 3. `card_type_merchant_benefit`（本 Phase）：特約商家額外加成，真正疊加於前兩層之上
+>
+> `final_rate = base_rate + mcc_bonus + merchant_bonus`
+
+---
+
+### DB Schema（Flyway migration）
+
+- [ ] **`card` 表**
+  - `card_id` BIGINT — Snowflake ID，PK
+  - `user_id` BIGINT — 持卡會員
+  - `card_type` VARCHAR(20) — `CLASSIC` / `OVERSEAS` / `PREMIUM` / `INFINITE`
+  - `card_network` VARCHAR(10) — `VISA` / `MASTERCARD` / `JCB`
+  - `status` VARCHAR(20) — 卡片狀態（見狀態機）
+  - `pan_encrypted` VARCHAR(512) — **AES-256 加密**儲存完整卡號（PCI DSS）
+  - `pan_masked` VARCHAR(20) — 遮罩格式 `****-****-****-1234`，用於顯示與 Kafka payload
+  - `cardholder_name_zh` VARCHAR(512) — 持卡人中文姓名，**AES-256 加密**儲存
+  - `cardholder_name_en` VARCHAR(512) — 持卡人英文姓名（卡面印刷用），**AES-256 加密**儲存
+  - `expiry_date` VARCHAR(512) — **AES-256 加密**儲存，格式 `MMYY`；申請日 + 5 年（PCI DSS）
+  - `activated_at` DATETIME(3) nullable — 卡片首次 ACTIVE 時間（稽核用）
+  - `cancelled_at` DATETIME(3) nullable — 卡片 CANCELLED 時間（稽核用）
+  - `created_at` / `updated_at` — 繼承 BaseTimeEntity
+  - **Unique constraint**：`(user_id, card_type)` WHERE status != 'CANCELLED'（應用層驗證，每人每卡種限一張有效卡）
+
+- [ ] **`card_type_limit` 表**（Flyway DML 種子資料）
+  - `card_type` VARCHAR(20) — PK
+  - `single_txn_limit` BIGINT — 單筆上限（分；NULL = 無上限）
+  - `daily_limit` BIGINT — 單日累計上限（分；NULL = 無上限）
+  - `domestic_reward_rate` DECIMAL(5,4) — 國內基礎回饋率（e.g., 0.0100）
+  - `overseas_reward_rate` DECIMAL(5,4) — 國外基礎回饋率（e.g., 0.0500）
+  - `fx_fee_rate` DECIMAL(5,4) — 跨國手續費率（e.g., 0.0100）
+  - `created_at` / `updated_at`
+
+  種子資料（Flyway DML）：
+
+  | card_type | single_txn_limit | daily_limit | domestic | overseas | fx_fee |
+  |-----------|-----------------|-------------|----------|----------|--------|
+  | CLASSIC | 10,000,000 | 20,000,000 | 0.0100 | 0.0000 | 0.0150 |
+  | OVERSEAS | 10,000,000 | 20,000,000 | 0.0000 | 0.0500 | 0.0100 |
+  | PREMIUM | 20,000,000 | 50,000,000 | 0.0200 | 0.0500 | 0.0100 |
+  | INFINITE | NULL | NULL | 0.0200 | 0.0500 | 0.0100 |
+
+- [ ] **`card_type_merchant_benefit` 表**（特約優惠，Flyway DML 種子資料）
+  - `benefit_id` BIGINT — Snowflake PK
+  - `card_type` VARCHAR(20) — 適用卡種
+  - `merchant_id` VARCHAR(50) nullable — 特定商家（null = 套用整個 MCC）
+  - `mcc_code` VARCHAR(10) nullable — 指定消費類別
+  - `bonus_rate` DECIMAL(5,4) — 加成回饋率（疊加於 base + mcc_bonus 之上）
+  - `description_zh` VARCHAR(255) — 優惠說明（中文）
+  - `description_en` VARCHAR(255) — 優惠說明（英文）
+  - `effective_from` DATE — 生效日
+  - `effective_to` DATE nullable — 到期日（null = 長期有效）
+  - `created_at` / `updated_at`
+
+- [ ] **每日交易累計追蹤**（供 Phase 7 daily_limit 查核）
+  - Redis key：`card:daily:{cardId}:{yyyyMMdd}`，值為當日累計金額（分）
+  - TTL：當日 23:59:59 到期（或固定 86400s）
+  - 無限卡（INFINITE）跳過此檢查
+
+---
+
+### 卡片 CRUD API（BFF + Card Service）
+
+- [ ] **申請虛擬卡**（`POST /api/v1/card/apply`）
+  - 驗證：同一 user 該 card_type 不得已有 PENDING / ACTIVE / FROZEN 的卡
+  - Mock 實作：依 `card_network` 使用對應 BIN prefix 產生合法 PAN（Luhn check）
+  - PAN 以 AES-256 加密落地（`pan_encrypted`）；同步產生並儲存 `pan_masked`
+  - **CVV**：申請時即時產生，僅在本次 Response 回傳一次，**絕不儲存**（PCI DSS）；之後無法再查詢
+  - `expiry_date` = 申請日 + 5 年，AES-256 加密後落地
+  - 初始狀態 `PENDING → ACTIVE`（本 MVP 直接核卡，略過審核流程）；寫入 `activated_at`
+  - BFF spec：`spec/mobile-bff/card-apply.md`
+  - biz spec：`spec/card-service/card-apply.md`
+
+- [ ] **查詢卡片資訊**（`GET /api/v1/card/info`）
+  - `pan_masked` 直接讀取回傳（已落地，不需解密）
+  - 解密 `expiry_date` / `cardholder_name_zh` / `cardholder_name_en` 後組裝回傳
+  - `pan_encrypted` 不回傳給 App（僅授權流程使用）
+  - BFF spec：`spec/mobile-bff/card-info.md`
+  - biz spec：`spec/card-service/card-info.md`
+
+- [ ] **凍結卡片**（`POST /api/v1/card/freeze`）
+  - 狀態轉移：`ACTIVE → FROZEN`
+  - BFF spec：`spec/mobile-bff/card-freeze.md`
+  - biz spec：`spec/card-service/card-freeze.md`
+
+- [ ] **解凍卡片**（`POST /api/v1/card/unfreeze`）
+  - 狀態轉移：`FROZEN → ACTIVE`
+  - BFF spec：`spec/mobile-bff/card-unfreeze.md`
+  - biz spec：`spec/card-service/card-unfreeze.md`
+
+- [ ] **查詢特約優惠**（`GET /api/v1/card/benefits`）
+  - 依 card_type 查詢目前有效的 `card_type_merchant_benefit`
+  - BFF spec：`spec/mobile-bff/card-benefits.md`
+  - biz spec：`spec/card-service/card-benefits.md`
+
+---
+
+### 卡片狀態機：`PENDING → ACTIVE → FROZEN → CANCELLED`
+
+- 狀態落地到 DB `card.status` 欄位（允許 UPDATE）
+- 合法轉移：PENDING→ACTIVE、ACTIVE→FROZEN、FROZEN→ACTIVE、ACTIVE→CANCELLED、FROZEN→CANCELLED
+- ⚠️ **「JVM Heap-only，禁止序列化與落地」是針對解密後的明文卡片資料，不是狀態機本身**
+
+---
+
+### PCI DSS 合規實作
+
+- [ ] **AES-256 加解密工具**：統一的加解密 Service，供 Card Service 使用；金鑰由環境變數 / KMS 注入，不寫入程式碼或 DB
+- [ ] **PAN 遮罩顯示**：解密後以程式碼產生遮罩格式 `****-****-****-1234`；可評估使用 Jackson 自訂 Serializer（`@JsonSerialize`）或 Logback `MaskingPatternLayout` 統一處理
+- [ ] **Log sanitization**：Logback filter，攔截 log 中的完整 PAN / CVV，強制替換為遮罩（`pan_encrypted` 在 DB 層，log 只可能印出解密後的值，需在此防守）
+- [ ] **CVV 不儲存**：申請卡時即時產生、一次性回傳，之後任何場景均不可查詢；授權流程中 CVV 僅存在 JVM，完成後立即清除（PCI DSS）
+- [ ] **Kafka event payload**：傳遞遮罩格式 `maskedPan`（runtime 從解密 PAN 產生），禁止 CVV 出現在任何 event
+
+---
+
+### ModelType 與錯誤碼（CardServiceException）
+
+- [ ] ModelType：`CA`，錯誤碼格式 `CA00001`
+  - `CARD_NOT_FOUND` CA00001
+  - `CARD_NOT_ACTIVE` CA00002
+  - `CARD_EXPIRED` CA00003
+  - `CARD_FROZEN` CA00004
+  - `CARD_CANCELLED` CA00005
+  - `SINGLE_TXN_LIMIT_EXCEEDED` CA00006
+  - `DAILY_LIMIT_EXCEEDED` CA00007
+  - `CARD_TYPE_NOT_FOUND` CA00008
+  - `CARD_ALREADY_EXISTS` CA00009 — 同卡種已有有效卡
 
 ---
 
@@ -34,14 +164,15 @@
 
 ## Phase 3 — 回饋方案設定（Reward Plan）
 
-**目標：** 建立 MCC → 回饋率映射，為授權流程中的點數回饋計算做準備
+**目標：** 建立 MCC → 回饋率映射，可綁定卡種，為授權流程中的點數回饋計算做準備
 
 - [ ] Points Service DB schema（Flyway migration）
-  - `reward_plan`：plan_id、mcc_code、reward_rate、effective_from、effective_to
+  - `reward_plan`：plan_id、`card_type`（nullable，null = 全卡種適用）、mcc_code、reward_rate、effective_from、effective_to
+    - 查詢優先順序：`card_type + mcc` > `null + mcc` > `DEFAULT`
   - `point_reward_batch`：batch_id、userId、source_txn_id、issued_amount、remaining_balance、status、expires_at
 - [ ] Flyway DML：初始 MCC 回饋率種子資料（含 `DEFAULT` fallback）
-- [ ] `ApplicationReadyEvent` 預載 `Map<mcc_code, rate>` 至記憶體；寫入時 cache invalidation
-- [ ] 回饋率查詢 Feign API（供 Card Service 呼叫）
+- [ ] `ApplicationReadyEvent` 預載 `Map<card_type+mcc_code, rate>` 至記憶體；寫入時 cache invalidation
+- [ ] 回饋率查詢 Feign API（供 Card Service 呼叫，傳入 card_type + mcc_code）
 
 ---
 
@@ -52,7 +183,7 @@
 - [ ] 匯率來源（開發環境 mock 固定值；正式接外部 API）
 - [ ] `lockRate(currency)` → fxRateId（Redis TTL 10 分鐘）
 - [ ] `getRate(fxRateId)` → 取回鎖定匯率
-- [ ] 外幣計算邏輯驗證（twd_base、fx_fee 1.5%、回饋基數為 twd_base）
+- [ ] 外幣計算邏輯驗證（twd_base、fx_fee 依卡種 card_type_limit.fx_fee_rate、回饋基數為 twd_base）
 
 ---
 
@@ -68,7 +199,10 @@
 - [ ] Mock 環境的 combineKey 固定值設定（供 Mock NCCC 加密使用）
 - [ ] Log sanitization：確認 PAN / CVV 不出現於任何 log
 - [ ] combineKey 基礎設施
-  - 從 KMS / 環境變數載入
+  - `card_key_parts` 表：三個 sourceKey 各自 AES-256 加密儲存；master key 從 KMS / 環境變數載入
+  - `ApplicationReadyEvent`：讀 `card_key_parts` → 解密三 part → 組合 combineKey，常駐 JVM Heap
+  - `@PreDestroy`：JVM 正常關閉時清除 Heap 中的 combineKey
+
 ---
 
 ## Phase 6 — OTP 產生與 SMS 通知（Notification）
@@ -90,7 +224,7 @@
 ### Phase 1：`POST /card/auth/authorize`
 
 - [ ] 以記憶體 combineKey 解密 encryptedCard
-- [ ] 由 PAN 識別會員
+- [ ] 由 PAN 識別會員（pan_hash 查詢）
 - [ ] 驗證卡片：ACTIVE、未過期
 - [ ] 檢查交易限額（single_txn_limit + 當日累計 daily_limit）
 - [ ] 讀取點數偏好 → 計算 pointsToUse（min 三值規則）
@@ -195,20 +329,3 @@
 
 ---
 
-## NCCC 3DS 流程參考（機密，不得外流）
-
-1. 持卡人確認購物，使用信用卡付款
-2. 驗證封包(AReq)傳送國際組織 DS; DS 回覆 ACS Server 驗證的結果(ARes)
-3. 國際組織將 AReq 封包加上 DS 欄位後轉給 ACS Server; 驗證結果(ARes)回覆 DS
-4. 若驗證結果需要進行卡人身份確認，導轉到 ACS Server 進行 OTP 的驗證
-5. ACS Server 產生取得 OTP 的身份驗證畫面
-6. 持卡人由身份驗證畫面按下"取得動態密碼"按鈕
-7. 通知銀行傳送 OTP 給持卡人
-8. 銀行由 SMS Server 發送 OTP 密碼至持卡人手機
-9. 持卡人輸入由簡訊收到的 OTP 密碼
-10. ACS Server 將持卡人輸入的 OTP 密碼傳送給銀行驗證是否正確
-11. 銀行回覆 OTP 密碼驗證結果
-12. 若 OTP 驗證結果正確，ACS Server 產生 CAVV/AAV 後組成身份驗證的 RReq 封包，
-RReq 轉送給 DS
-13. 國際組織將 RReq 封包加上 DS 欄位後轉給 3DS Server
-14. ACS Server 經由轉址通知商店身份認證結果完成
