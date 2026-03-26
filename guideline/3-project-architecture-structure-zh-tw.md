@@ -340,9 +340,12 @@ Service 承載可重複使用的業務邏輯與子流程。
 - 不得依賴 Controller 或 Use Case
 - 可依賴 Repository 或 Adapter 的 Port 介面
 - 不得協調跨 Use Case 的流程
- 
+- 回傳型別必須為 Domain Model、Vo 或 Dto — 不得回傳 Rs
+  - Rs 是對外的資料契約；由 Service 回傳 Rs 會將 Service 與特定 API 形狀耦合，導致無法跨 Use Case 重用
+  - 將結果轉換為 Rs 的責任，由 UseCase 獨立承擔
+
 ---
- 
+
 ### 4.6 Repository
  
 Repository 定義資料存取的抽象介面。

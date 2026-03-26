@@ -338,9 +338,12 @@ The Service carries reusable business logic and sub-processes.
 - Must not depend on Controller or Use Case
 - May depend on Repository or Adapter Port interfaces
 - Must not coordinate cross-Use Case flows
- 
+- Must return Domain Model, Vo, or Dto — must not return Rs
+  - Rs is an external contract; returning it from a Service couples the Service to a specific API shape and prevents it from being reused across different Use Cases
+  - The responsibility of converting to Rs belongs exclusively to the UseCase
+
 ---
- 
+
 ### 4.6 Repository
  
 The Repository defines the abstract interface for data access.
