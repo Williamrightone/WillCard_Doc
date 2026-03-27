@@ -39,6 +39,16 @@ When creating or editing documentation, **always maintain both language versions
 6. **PCI DSS** — Card data encryption rules, AES-256 for CHD, CVV never stored, log sanitization requirements, audit trail retention
 7. **Spec Guideline** — The canonical reference for writing API specs (see below)
 
+## Database Specs
+
+The `database/` directory contains DDL + DML references for each service's database, one file per service (e.g. `auth_db.md`, `card_db.md`).
+
+**When writing or updating API specs, always check whether `database/` needs to be created or updated:**
+- New table or column → add/update the DDL block in the corresponding `database/{service}_db.md`.
+- New seed data schema change → update the DML block.
+- DML-only changes (data fixes, adding seed rows with no schema change) → do NOT update `database/` files.
+- If a `database/{service}_db.md` does not yet exist for that service, create it following the format of `database/auth_db.md`.
+
 ## Writing API Specifications
 
 Specs follow strict conventions defined in `guideline/7-spec-guideline.md`. Key rules:
