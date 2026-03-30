@@ -211,11 +211,38 @@ isOverseas = false → domestic_reward_rate
 
 ## Phase 8 — card-service auth/authorize（OTP 生成 + 限額核查）
 
-**目標：** 驗卡、限額核查、生成 OTP 並發送 SMS
+**目標：** 驗卡、限額核查、生成 OTP，透過 OTP 發送策略（Telegram 實作，SMS stub）通知使用者
 
 > **重要：** card-service 在此設計下**不呼叫 FX Service 也不呼叫 Wallet Service**。`txnTwdBaseAmount` 由 ORCH 計算後透過 MockNCCC 傳入請求。Wallet reserve/confirm/release 由 ORCH 統一處理。
 
-> spec: `spec/card-service/card-auth-authorize.md`（待補）
+> spec: `spec/card-service/card-auth-authorize.md` ✅
+> spec: `spec/card-service/card-plain.md` ✅（Mock NCCC 用內部明文端點）
+> spec: `spec/notify-service/otp-delivery.md` ✅（OTP 策略消費者）
+
+### DB — member_otp_channel（uaa_db）
+
+會員 OTP 發送頻道設定表，位於 auth-service 的 `uaa_db`。
+
+| 欄位 | 型別 | 說明 |
+|------|------|------|
+| channel_id | BIGINT | PK，Snowflake ID |
+| member_id | BIGINT | 所屬會員 |
+| channel_type | ENUM('TELEGRAM','SMS') | 頻道類型 |
+| contact_value | VARCHAR(255) | Telegram chat_id 或 E.164 手機號碼；不記錄 log |
+| masked_value | VARCHAR(100) | Log 安全遮罩值 |
+| is_primary | TINYINT(1) | 是否為主要頻道（每個 channel_type 至多一筆） |
+| status | ENUM('ACTIVE','DISABLED') | 頻道狀態 |
+
+> 詳見 `database/auth_db.md` — `member_otp_channel` 表。
+
+### OTP 通知策略（notify-service）
+
+| Adapter | 狀態 | 行為 |
+|---------|------|------|
+| `TelegramOtpAdapter` | **已實作** | 呼叫 Telegram Bot API，以 `chat_id` 發送 OTP 訊息 |
+| `SmsOtpAdapter` | **僅 Stub** | 記錄 WARN log，不實際發送 |
+
+notify-service 消費 RabbitMQ `notification.otp.send` 訊息（`{ userId, otp }`），查詢 auth-service internal 取得會員頻道，依策略發送。
 
 ### Redis OTP Session（card-service 所有）
 
@@ -243,33 +270,34 @@ isOverseas = false → domestic_reward_rate
 | Step | 說明 |
 |------|------|
 | 1 | 以 `CombineKeyHolder` 取得 combineKey；null → 拋 CA00013 HTTP 503 |
-| 2 | AES-256-GCM 解密 `encryptedCard` → `{ pan, expiryMMYY, cvvItoken }` |
-| 3 | HMAC-SHA256(pan) → pan_hash，查詢 DB 識別 userId / cardId / cardType / maskedPan |
+| 2 | AES-256-GCM 解密 `encryptedCard` → `{ pan, expiryMMYY, cvvItoken }`；try-finally 確保清零 pan |
+| 3 | HMAC-SHA256(pan) → pan_hash，查詢 DB；找不到 → CA00001 |
 | 4 | 比對 cvvItoken：received == card.cvv_itoken；不符 → CA00014 |
-| 5 | 驗卡：status = ACTIVE、expiry 未過期（CA00002 / CA00003 / CA00004） |
+| 5 | 驗卡：status = ACTIVE（CA00002 / CA00004）、expiry 未過期（CA00003） |
 | 6 | 單筆限額：txnTwdBaseAmount ≤ single_txn_limit（INFINITE 跳過）→ CA00006 |
 | 7 | 當日累計：Redis GET `card:daily:{cardId}:{yyyyMMdd}` + txnTwdBaseAmount ≤ daily_limit → CA00007 |
-| 8 | 產生 6 位 OTP（SecureRandom） |
-| 9 | 發布 RabbitMQ `notification.otp.sms`（userId、手機號遮罩、otp）→ notify-service 送 SMS |
+| 8 | 產生 challengeRef（UUID）+ 6 位 OTP（SecureRandom） |
+| 9 | 發布 RabbitMQ exchange `notification` routing key `otp.send`：`{ userId, otp }` → notify-service 依策略發送 |
 | 10 | 儲存 Redis OTP Session（TTL 180s） |
 | 11 | 清零 PAN 明文位元組（try-finally 保證執行） |
 | 12 | Response：`{ challengeRef }` |
-
-### Notification Service — OTP SMS
-
-- RabbitMQ Consumer：Queue `notification.otp.sms`
-- 手機號碼遮罩 log（`09xx****xx`）
-- SMS 範本：`您的 WillCard 交易驗證碼為 {otp}，有效期限 3 分鐘，請勿告知他人。`
 
 ---
 
 ## Phase 9 — card-service auth/verify-challenge（OTP 驗證）
 
-**目標：** 驗證 OTP、更新每日累計限額、分配 txnId；Wallet confirm 與 Kafka 發布由 ORCH 執行
+**目標：** 驗證 OTP、更新每日累計限額、分配 txnId；Wallet confirm 與 `txn.card.authorized` Kafka 由 ORCH 執行
 
-> **重要：** verify-challenge **不呼叫** wallet-service，也**不發布** Kafka。這兩個動作已移至 ORCH Leg 2 flow（Phase 7a Step 3–4）。
+> **重要：** verify-challenge **不呼叫** wallet-service，也**不發布** `txn.card.authorized`。這兩個動作已移至 ORCH Leg 2 flow（Phase 7a Step 3–4）。
+> 唯一的 Kafka 事件為 `card.risk.otp-threshold-exceeded`（風控事件，僅卡片鎖定時觸發）。
 
-> spec: `spec/card-service/card-auth-verify-challenge.md`（待補）
+> spec: `spec/card-service/card-auth-verify-challenge.md` ✅
+
+### 關鍵設計說明
+
+- **cardType / maskedPan** 不在 OTP Session，APPROVED 路徑需額外 DB READ（Step 5）
+- **兩個計數器先遞增，再判斷條件**：`otp:card:fail:{cardId}` 與 `otp:attempt:{challengeRef}` 在任何條件判斷前先 INCR
+- **嚴重度排序**：卡片鎖定（≥ 5 次 / 15 分鐘）優先於 Session 作廢（≥ 3 次 / Session）
 
 ### UseCase Flow（`POST /card-service/auth/verify-challenge`）
 
@@ -278,14 +306,17 @@ isOverseas = false → domestic_reward_rate
 | 1 | Redis GET `otp:{challengeRef}`；不存在 → Response `{ result: DECLINED, reason: SESSION_EXPIRED }` |
 | 2 | 比對 OTP 值（session.otpValue == 輸入值） |
 | **OTP 正確** | |
-| 3 | Redis INCR `card:daily:{cardId}:{yyyyMMdd}`（加 txnTwdBaseAmount，TTL 至當日 23:59:59） |
+| 3 | INCRBY `card:daily:{cardId}:{yyyyMMdd}` txnTwdBaseAmount；新 key → TTL 至當日 23:59:59 Asia/Taipei |
 | 4 | 分配 txnId（Snowflake） |
-| 5 | DEL `otp:{challengeRef}` |
-| 6 | Response：`{ result: APPROVED, txnId, cardType, maskedPan }` |
+| 5 | DB READ：SELECT card_type, pan_masked FROM card WHERE card_id = session.cardId |
+| 6 | DEL `otp:{challengeRef}` |
+| 7 | Response：`{ result: APPROVED, txnId, cardType, maskedPan }` |
 | **OTP 錯誤** | |
-| 7 | INCR `otp:attempt:{challengeRef}`（TTL 180s）；≥ 3 → DEL session；Response：`{ result: DECLINED, reason: SESSION_VOIDED }` |
-| 8 | INCR `otp:card:fail:{cardId}`（TTL 900s）；≥ 5 → 卡片 FROZEN + Kafka `card.risk.otp-threshold-exceeded`；Response：`{ result: DECLINED, reason: CARD_LOCKED }` |
-| 9 | Response：`{ result: DECLINED, reason: OTP_FAILED, remainingAttempts }` |
+| 8 | INCR `otp:card:fail:{cardId}`（TTL 900s，新 key 時設定）→ cardFailCount |
+| 9 | INCR `otp:attempt:{challengeRef}`（TTL 180s，新 key 時設定）→ attemptCount |
+| 10 | 若 cardFailCount ≥ 5 → DB WRITE FROZEN + DEL session + Kafka `card.risk.otp-threshold-exceeded` + Response CARD_LOCKED |
+| 11 | 若 attemptCount ≥ 3 → DEL session + Response SESSION_VOIDED |
+| 12 | Response：`{ result: DECLINED, reason: OTP_FAILED, remainingAttempts: 3 - attemptCount }` |
 
 > **ORCH 負責** wallet release（SESSION_VOIDED / CARD_LOCKED 時）與 wallet confirmDeduct / Kafka txn.card.authorized publish（APPROVED 時）。
 
