@@ -48,18 +48,17 @@ Each batch expires at the **end of the same calendar month one year after issuan
 ### Issuance Formula
 
 ```
-reward_points = floor(txn_twd_base_amount × final_rate)
-
-final_rate = base_rate + mcc_bonus + merchant_bonus
+reward_points = floor(txn_twd_base_amount × base_rate)
 ```
 
-| Layer | Source |
-|-------|--------|
-| `base_rate` | `card_type_limit.domestic_reward_rate` or `overseas_reward_rate` |
-| `mcc_bonus` | `reward_plan` (Phase 3) |
-| `merchant_bonus` | `card_type_merchant_benefit` (Phase 1) |
+| Variable | Source |
+|----------|--------|
+| `txn_twd_base_amount` | Transaction amount in TWD cents, before FX fees |
+| `base_rate` | `card_type_limit.domestic_reward_rate` or `overseas_reward_rate` (domestic vs. overseas determined by transaction currency) |
 
 > Points are always calculated on the **pre-FX-fee TWD base amount**. FX fees do not earn rewards.
+
+> **Future enhancement:** The formula will be expanded to `floor(txn_twd_base_amount × (base_rate + mcc_bonus + merchant_bonus))` when MCC-based reward plans and merchant bonuses are introduced. See [guideline/13-reward-plan.md](/guideline/13-reward-plan.md) Section 8.
 
 ---
 

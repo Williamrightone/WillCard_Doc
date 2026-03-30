@@ -1,108 +1,288 @@
 # Transaction Flow
 
-This chapter defines the business rules, flow design, and conventions for credit card transactions in WillCard. All specs under `spec/mobile-bff/card-pay*`, `spec/card-service/`, `spec/wallet-service/`, `spec/points-service/`, and `spec/ledger-service/` must conform to these rules.
+This chapter defines the business rules, flow design, and conventions for credit card transactions in WillCard. All specs under `spec/mobile-bff/card-pay*`, `spec/mock-nccc/`, `spec/card-service/`, `spec/wallet-service/`, `spec/points-service/`, and `spec/ledger-service/` must conform to these rules.
 
 ---
 
-## 1. WillCard as Card Issuer
+## 1. WillCard as Issuer
 
 WillCard issues virtual Visa/Mastercard cards backed by the member's e-wallet balance. In Taiwan's card payment ecosystem, **NCCC (聯合信用卡處理中心 / 財金公司)** acts as the card network and clearing house.
 
-**WillCard is the Issuer. Authorization requests flow inward — NCCC calls WillCard, not the other way around.**
+**WillCard is the Issuer. The cardholder initiates from the App; WillCard BFF actively calls Mock NCCC, forwarding transaction details and the CVV iToken; Mock NCCC then calls card-service to perform issuer authorization.**
+
+> In a real production network, the card network (NCCC) would route inbound authorization requests to WillCard as the issuer. In this project's mock setup the direction is reversed: the App triggers the flow through BFF, and WillCard is the party that actively calls out to Mock NCCC.
 
 ```
-[Production — inbound]
+[Production reference — inbound from card network]
 Cardholder uses virtual card at merchant
   → Merchant terminal / checkout
   → Acquiring bank
   → NCCC
   → WillCard Card Service (Issuer Authorization API)   ← called here
-       ↓ on approval (async)
-  Internal Saga: Ledger · Points · Notification
+       ↓ on approval (async, Kafka fan-out)
+  Points Service · Ledger Service · Notification Service
 
-[Development — Mock NCCC]
-App → BFF → Mock NCCC Service → WillCard Card Service (same auth path)
+[Development — WillCard calls Mock NCCC outbound]
+App → BFF → Mock NCCC Service
+              ↓ (forward txn details + cvvItoken)
+              → WillCard Card Service (auth/authorize)
+                   ↓ on approval (async, Kafka fan-out)
+             Points Service · Ledger Service · Notification Service
 ```
 
 **Key identifiers:**
 
-| Field | Produced by | Scope | Purpose |
-|-------|------------|-------|---------|
-| `challengeRef` | Card Service (Phase 1) | Auth session | OTP binding; ties Phase 1 and Phase 2 together |
-| `txnId` | Card Service (Phase 2, on approval) | Transaction record | Ledger, Kafka events, reconciliation |
+| Field | Produced by | Lifecycle | Purpose |
+|-------|------------|-----------|---------|
+| `challengeRef` | Card Service (auth/authorize) | OTP session (TTL 180s) | OTP binding; ties authorize and verify-challenge together |
+| `txnId` | Card Service (verify-challenge, on approval) | Transaction record | Ledger, Kafka events, reconciliation |
+| `reservationId` | Wallet Service (reserve) | Points hold (TTL 180s) | Links points reservation to transaction; null if no points used |
 
 ---
 
-## 2. Issuer Authorization API (Card Service)
+## 2. Complete End-to-End Transaction Flow
 
-Card Service exposes two endpoints that **NCCC calls directly** — not routed through BFF.
+### 2.1 Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant BFF as mobile-bff
+    participant MNCCC as mock-nccc
+    participant CS as card-service
+    participant NS as notify-service
+    participant WS as wallet-service
+    participant FX as fx-service
+    participant Redis
+    participant KFK as Kafka
+    participant PS as points-service
+    participant LS as ledger-service
+
+    Note over App,KFK: ── Leg 1: Initiate Payment ──
+
+    App->>BFF: POST /api/v1/card/pay<br/>{cardId, amount, currency, merchantId, usePoints}
+    BFF->>BFF: Validate JWT → inject X-Member-Id
+    BFF->>Redis: SET idempotency key (TTL 60s)
+    BFF->>KFK: Publish operation-log.card.pay (L1)
+    BFF->>MNCCC: POST /mock-nccc/pay (Feign)
+
+    Note over MNCCC,CS: ── Mock NCCC: Assemble encryptedCard ──
+    MNCCC->>CS: GET /card-service/internal/cards/{cardId}/plain
+    CS-->>MNCCC: {pan, expiryMMYY, cvvItoken}
+    MNCCC->>MNCCC: AES-256-GCM encrypt<br/>{pan,expiryMMYY,cvvItoken} → encryptedCard
+    MNCCC->>CS: POST /card-service/auth/authorize<br/>{encryptedCard, amount, currency, merchantId, usePoints}
+
+    Note over CS: ── card-service: auth/authorize (Steps 1–15) ──
+    CS->>CS: 1. CombineKeyHolder.get() — null→CA00013
+    CS->>CS: 2. AES-256-GCM decrypt encryptedCard<br/>→ {pan, expiryMMYY, cvvItoken}
+    CS->>CS: 3. HMAC-SHA256(pan)→pan_hash<br/>DB lookup → userId/cardId
+    CS->>CS: 4. Compare cvvItoken vs card.cvv_itoken<br/>mismatch → CA00014
+    CS->>CS: 5. Validate status=ACTIVE, expiry valid<br/>fail→CA00002/CA00003/CA00004
+
+    alt Foreign currency
+        CS->>FX: POST /fx-service/convert {amount, currency}
+        FX-->>CS: txnTwdBaseAmount
+    end
+
+    CS->>CS: 6. Single txn limit check → CA00006
+    CS->>Redis: 7. GET card:daily:{cardId}:{yyyyMMdd}
+    CS->>CS: Daily cumulative check → CA00007
+
+    alt usePoints = true
+        CS->>WS: POST /wallet-service/reserve {userId, pointsToUse}
+        WS-->>CS: reservationId
+        Note right of WS: available_balance -= pointsToUse<br/>reserved_balance += pointsToUse
+    end
+
+    CS->>CS: 11. Generate 6-digit OTP (SecureRandom)
+    CS->>NS: RabbitMQ: notification.otp.sms<br/>{userId, maskedPhone, otp}
+    NS-->>App: SMS: "WillCard OTP: xxxxxx (3 min)"
+    CS->>Redis: 13. SET otp:{challengeRef} (TTL 180s)<br/>{userId,cardId,txnAmount,txnTwdBaseAmount,<br/>isOverseas,pointsToUse,reservationId,otpValue}
+    CS->>CS: 14. Zero-fill PAN byte array
+    CS-->>MNCCC: {challengeRef, pointsToUse, estimatedTwdAmount}
+    MNCCC-->>BFF: {challengeRef, pointsToUse, estimatedTwdAmount}
+    BFF-->>App: {challengeRef, pointsToUse, estimatedTwdAmount}
+
+    Note over App: Display OTP input + points offset preview
+
+    Note over App,KFK: ── Leg 2: Submit OTP ──
+
+    App->>BFF: POST /api/v1/card/pay/confirm<br/>{challengeRef, otp}
+    BFF->>KFK: Publish operation-log.card.pay-confirm (L1)
+    BFF->>MNCCC: POST /mock-nccc/pay/confirm (Feign)
+    MNCCC->>CS: POST /card-service/auth/verify-challenge<br/>{challengeRef, otp}
+
+    Note over CS: ── card-service: verify-challenge ──
+    CS->>Redis: GET otp:{challengeRef}
+    Note right of Redis: not found → SESSION_EXPIRED
+
+    alt OTP correct
+        CS->>WS: POST /wallet-service/confirm-deduct {reservationId}
+        Note right of WS: reserved_balance -= pointsToUse
+        CS->>Redis: INCR card:daily:{cardId}:{yyyyMMdd} (add txnTwdBaseAmount)
+        CS->>CS: Assign txnId (Snowflake)
+        CS->>KFK: Publish txn.card.authorized
+        CS->>Redis: DEL otp:{challengeRef}
+        CS-->>MNCCC: {result: APPROVED, txnId}
+        MNCCC-->>BFF: {result: APPROVED, txnId}
+        BFF-->>App: {result: APPROVED, txnId}
+    else OTP wrong (≥ 3 per-session → void; ≥ 5 per-card → FROZEN)
+        CS->>Redis: INCR otp:attempt:{challengeRef}
+        CS->>Redis: INCR otp:card:fail:{cardId}
+        CS-->>MNCCC: {result: DECLINED, reason}
+        MNCCC-->>BFF: DECLINED
+        BFF-->>App: DECLINED + reason
+    end
+
+    Note over KFK,LS: ── Post-auth Async (Kafka fan-out) ──
+    KFK->>PS: txn.card.authorized → calc reward points
+    PS->>WS: credit(userId, rewardPoints)
+    KFK->>LS: txn.card.authorized → journal_entry INSERT
+    KFK->>NS: txn.card.authorized → push receipt + email
+    NS-->>App: Push notification: transaction receipt
+```
+
+### 2.2 Step-by-Step Service Breakdown
+
+| # | Service | Action | Redis / DB / Event State |
+|---|---------|--------|--------------------------|
+| **Leg 1 — Initiate Payment** | | | |
+| 1 | App | `POST /api/v1/card/pay` — `{cardId, amount, currency, merchantId, usePoints}` | — |
+| 2 | BFF | Validate JWT; extract `userId`; inject `X-Member-Id` header | — |
+| 3 | BFF | Check Redis idempotency key; duplicate → return cached response | Redis `SET idempotency:{hash}` TTL 60s |
+| 4 | BFF | Publish `operation-log.card.pay` (L1) | Kafka: `operation-log.card.pay` |
+| 5 | BFF→Mock NCCC | Feign `POST /mock-nccc/pay` | — |
+| 6 | Mock NCCC | Feign `GET /card-service/internal/cards/{cardId}/plain` | — |
+| 7 | Card Service | Return `{pan, expiryMMYY, cvvItoken}` from DB (dev/mock profile only) | DB READ `card` |
+| 8 | Mock NCCC | AES-256-GCM encrypt `{pan, expiryMMYY, cvvItoken}` → `encryptedCard` using `MOCK_COMBINE_KEY` | — |
+| 9 | Mock NCCC→Card Service | Feign `POST /card-service/auth/authorize` | — |
+| **auth/authorize — Decrypt & Validate** | | | |
+| 10 | Card Service | `CombineKeyHolder.get()` combineKey; null → throw `CA00013` HTTP 503 | — |
+| 11 | Card Service | AES-256-GCM decrypt `encryptedCard` → `{pan, expiryMMYY, cvvItoken}` in JVM heap | — |
+| 12 | Card Service | `HMAC-SHA256(pan, PAN_HMAC_KEY)` → `pan_hash`; DB lookup by `pan_hash` → `cardId`, `userId` | DB READ `card` |
+| 13 | Card Service | Compare received `cvvItoken` vs `card.cvv_itoken`; mismatch → throw `CA00014` | DB READ |
+| 14 | Card Service | Validate `status = ACTIVE`, expiry not past; fail → `CA00002` / `CA00003` / `CA00004` | DB READ |
+| **auth/authorize — Limits & Points** | | | |
+| 15 | Card Service | Determine `isOverseas` (currency ≠ TWD); if foreign → Feign `POST /fx-service/convert` → `txnTwdBaseAmount` | Feign: fx-service |
+| 16 | Card Service | Single txn limit: `txnTwdBaseAmount ≤ single_txn_limit` (INFINITE skips) → `CA00006` | DB READ `card_type_limit` |
+| 17 | Card Service | Daily limit: Redis `GET card:daily:{cardId}:{yyyyMMdd}` + `txnTwdBaseAmount ≤ daily_limit` → `CA00007` | Redis READ |
+| 18 | Card Service | Points: `usePoints ? min(available_balance, txnTwdBaseAmount) : 0` → `pointsToUse` | Feign: wallet-service |
+| 19 | Card Service | If `pointsToUse > 0`: Feign `wallet-service/reserve(userId, pointsToUse)` → `reservationId` | `available_balance -= pts`, `reserved_balance += pts` |
+| **auth/authorize — OTP & Response** | | | |
+| 20 | Card Service | Generate 6-digit OTP (`SecureRandom`) | JVM heap only |
+| 21 | Card Service | Publish RabbitMQ `notification.otp.sms` `{userId, maskedPhone, otp}` | RabbitMQ queue |
+| 22 | Notify Service | Consume `notification.otp.sms`; send SMS to member's registered phone | SMS sent |
+| 23 | Card Service | `SET` Redis OTP session `otp:{challengeRef}` (TTL 180s) with full txn context + `otpValue` | Redis WRITE |
+| 24 | Card Service | Zero-fill PAN plaintext byte array (try-finally) | — |
+| 25 | Card Service | Return `{challengeRef, pointsToUse, estimatedTwdAmount}` | — |
+| 26 | Mock NCCC | Forward response to BFF | — |
+| 27 | BFF | Return `{challengeRef, pointsToUse, estimatedTwdAmount}` to App | — |
+| 28 | App | Display OTP input screen + points offset preview | — |
+| **Leg 2 — Submit OTP** | | | |
+| 29 | App | `POST /api/v1/card/pay/confirm` — `{challengeRef, otp}` | — |
+| 30 | BFF | Validate JWT; publish `operation-log.card.pay-confirm` (L1) | Kafka: `operation-log.card.pay-confirm` |
+| 31 | BFF→Mock NCCC | Feign `POST /mock-nccc/pay/confirm` | — |
+| 32 | Mock NCCC→Card Service | Feign `POST /card-service/auth/verify-challenge` | — |
+| **verify-challenge — OTP Correct Path** | | | |
+| 33 | Card Service | Redis `GET otp:{challengeRef}`; not found → `DECLINED + SESSION_EXPIRED` | Redis READ |
+| 34 | Card Service | Compare `session.otpValue == submitted otp`; match → continue | — |
+| 35 | Card Service | If `reservationId` not null: Feign `wallet-service/confirm-deduct(reservationId)` | `reserved_balance -= pts` |
+| 36 | Card Service | Redis `INCR card:daily:{cardId}:{yyyyMMdd}` by `txnTwdBaseAmount`; set TTL to 23:59:59 | Redis WRITE |
+| 37 | Card Service | Assign `txnId` (Snowflake) | — |
+| 38 | Card Service | Kafka Publish `txn.card.authorized` (full payload) | Kafka: `txn.card.authorized` |
+| 39 | Card Service | Redis `DEL otp:{challengeRef}` | Redis DELETE |
+| 40 | Card Service | Return `{result: APPROVED, txnId}` | — |
+| 41 | Mock NCCC / BFF | Forward `APPROVED + txnId` to App | — |
+| **verify-challenge — OTP Wrong Path** | | | |
+| 42 | Card Service | `INCR otp:attempt:{challengeRef}` (TTL 180s); ≥ 3 → void session + release if `reservationId` → `DECLINED + SESSION_VOIDED` | Redis WRITE |
+| 43 | Card Service | `INCR otp:card:fail:{cardId}` (TTL 900s); ≥ 5 → freeze card + Kafka `card.risk.otp-threshold-exceeded` + release → `DECLINED + CARD_LOCKED` | Redis WRITE; Kafka |
+| 44 | Card Service | Return `DECLINED + OTP_FAILED + attemptsRemaining` | — |
+| **Post-Auth Async (Kafka fan-out)** | | | |
+| 45 | Points Service | Consume `txn.card.authorized`; calculate `reward_points`; Feign `wallet-service/credit`; insert `point_reward_batch` (PENDING) | DB WRITE `point_reward_batch` |
+| 46 | Ledger Service | Consume `txn.card.authorized`; insert `journal_entry` rows (idempotent: `ON DUPLICATE IGNORE`) | DB WRITE `journal_entry` |
+| 47 | Notify Service | Consume `txn.card.authorized`; push notification + email receipt | Push + email sent |
+
+---
+
+## 3. Issuer Authorization API (Card Service)
+
+Card Service exposes two endpoints that **NCCC calls directly** (production: mutual TLS; development: Mock NCCC on internal network).
 
 | Endpoint | Caller | Purpose |
 |----------|--------|---------|
-| `POST /card/auth/authorize` | NCCC | Initial auth request — validate card, check funds, trigger 3DS OTP |
-| `POST /card/auth/verify-challenge` | NCCC | OTP verification — final approval / decline |
+| `POST /card-service/auth/authorize` | NCCC / Mock NCCC | Decrypt card data, validate, generate OTP |
+| `POST /card-service/auth/verify-challenge` | NCCC / Mock NCCC | Verify OTP; finalize approval or decline |
 
-Security: Production uses mutual TLS with NCCC client certificate. Development uses Mock NCCC on internal network.
-
-### 2.1 Phase 1 — authorize
+### 3.1 auth/authorize — UseCase Flow
 
 ```
-NCCC → POST /card/auth/authorize
-  Request:
-    encryptedCard     — card data encrypted by NCCC using combineKey
-    amount            — transaction amount
-    currency          — TWD / USD / ...
-    merchantId
-    merchantMCC       — used for reward rate lookup
+Request: { encryptedCard, amount, currency, merchantId, usePoints, userId }
 
-  Card Service steps:
-    1. Decrypt encryptedCard (in-memory combineKey)
-    2. Identify member from PAN
-    3. Validate card: ACTIVE, not expired
-    4. Enforce transaction limits (single txn + daily cumulative)
-    5. Read member's points preference → calculate pointsToUse (see §4)
-    6. Check funds: (wallet_balance - pointsToUse) >= cardAmount
-    7. Reserve points tentatively: Wallet Service.reserve(userId, pointsToUse)
-    8. Lock FX rate if currency ≠ TWD: FX Service.lockRate() → fxRateId
-    9. Generate 6-digit OTP → SMS to member's registered phone
-   10. Store pending auth in Redis: otp:{challengeRef} TTL 180s
-       Payload: { txnDetails, pointsToUse, reservationId, fxRateId? }
+Step  1  [DOMAIN]   CombineKeyHolder.get() — null → CA00013 HTTP 503
+Step  2  [DOMAIN]   AES-256-GCM decrypt encryptedCard → { pan, expiryMMYY, cvvItoken }
+Step  3  [DB READ]  HMAC-SHA256(pan, PAN_HMAC_KEY) → pan_hash; SELECT card WHERE pan_hash = ?
+Step  4  [DOMAIN]   Compare cvvItoken: encryptedCard.cvvItoken == card.cvv_itoken; mismatch → CA00014
+Step  5  [DOMAIN]   Validate card: status = ACTIVE, expiry ≥ today; fail → CA00002 / CA00003 / CA00004
+Step  6  [DOMAIN]   Currency: TWD → txnTwdBaseAmount = amount; foreign → Feign POST /fx-service/convert
+Step  7  [DOMAIN]   Single txn limit: txnTwdBaseAmount ≤ single_txn_limit (INFINITE skips) → CA00006
+Step  8  [REDIS]    Daily limit: GET card:daily:{cardId}:{yyyyMMdd} + txnTwdBaseAmount ≤ daily_limit → CA00007
+Step  9  [FEIGN]    Read wallet available_balance; pointsToUse = usePoints ? min(balance, txnTwdBaseAmount) : 0
+Step 10  [FEIGN]    If pointsToUse > 0: wallet-service.reserve(userId, pointsToUse) → reservationId
+Step 11  [DOMAIN]   Generate 6-digit OTP (SecureRandom)
+Step 12  [RABBIT]   Publish notification.otp.sms { userId, maskedPhone, otp }
+Step 13  [REDIS]    SET otp:{challengeRef} TTL 180s (see §3.3 for payload)
+Step 14  [DOMAIN]   Zero-fill PAN plaintext byte array (try-finally guarantee)
+Step 15  [RETURN]   { challengeRef, pointsToUse, estimatedTwdAmount }
 
-  Response:
-    CHALLENGE_REQUIRED  + challengeRef + pointsPreview
-    DECLINED            + declineReason
+Compensation: any failure at Step 6+ after reserve → release(reservationId)
 ```
 
-### 2.2 Phase 2 — verify-challenge
+### 3.2 auth/verify-challenge — UseCase Flow
 
 ```
-NCCC → POST /card/auth/verify-challenge
-  Request:
-    challengeRef
-    otp               — submitted by cardholder
+Request: { challengeRef, otp }
 
-  Card Service steps:
-    1. Load pending auth from Redis otp:{challengeRef}
-    2. Verify OTP value
-    3a. OTP valid:
-        → Wallet Service.confirmDeduct(reservationId)
-        → Assign txnId (Snowflake)
-        → Publish txn.card.authorized Kafka event (async Saga)
-        → Clear Redis key
-    3b. OTP invalid:
-        → Increment otp:attempt:{challengeRef} (per-session)
-        → Increment otp:card:fail:{cardId}     (per-card, TTL 900s)
-        → Check thresholds (see §2.3)
+Step  1  [REDIS]    GET otp:{challengeRef}; not found → DECLINED + SESSION_EXPIRED
 
-  Response (OTP valid):
-    APPROVED  + authCode + txnId + pointsUsed + cardAmount
-  Response (OTP invalid):
-    DECLINED  + OTP_FAILED + attemptsRemaining
-  Response (card locked):
-    DECLINED  + CARD_LOCKED
+── OTP Correct ──
+Step  2  [FEIGN]    If reservationId != null: wallet-service.confirmDeduct(reservationId)
+Step  3  [REDIS]    INCR card:daily:{cardId}:{yyyyMMdd} by txnTwdBaseAmount; EXPIREAT 23:59:59
+Step  4  [DOMAIN]   Assign txnId (Snowflake)
+Step  5  [KAFKA]    Publish txn.card.authorized (see §6.1 for payload)
+Step  6  [REDIS]    DEL otp:{challengeRef}
+Step  7  [RETURN]   { result: APPROVED, txnId }
+
+── OTP Wrong ──
+Step  8  [REDIS]    INCR otp:attempt:{challengeRef} (TTL 180s)
+         ≥ 3 → void session; if reservationId → release; RETURN DECLINED + SESSION_VOIDED
+Step  9  [REDIS]    INCR otp:card:fail:{cardId} (TTL 900s)
+         ≥ 5 → UPDATE card SET status=FROZEN; Kafka card.risk.otp-threshold-exceeded; release; RETURN DECLINED + CARD_LOCKED
+Step 10  [RETURN]   DECLINED + OTP_FAILED + attemptsRemaining
 ```
 
-### 2.3 OTP Failure Thresholds
+### 3.3 Redis OTP Session Payload
+
+```json
+{
+  "userId": 123,
+  "cardId": 456,
+  "txnAmount": 10000,
+  "txnCurrency": "USD",
+  "txnTwdBaseAmount": 316000,
+  "isOverseas": true,
+  "pointsToUse": 5000,
+  "reservationId": 789,
+  "merchantId": "MERCHANT_001",
+  "otpValue": "123456"
+}
+```
+
+> `txnTwdBaseAmount`: TWD if domestic; FX converted amount if foreign.
+> `reservationId`: null if `pointsToUse = 0`.
+
+---
+
+## 4. OTP Failure Thresholds
 
 Two independent layers protect against accidental retry and card theft probing.
 
@@ -112,7 +292,7 @@ Two independent layers protect against accidental retry and card theft probing.
 |------|-------|
 | Redis key | `otp:attempt:{challengeRef}` (TTL 180s) |
 | Max retries | 3 |
-| On limit reached | This authorization cancelled; card unaffected |
+| On limit reached | This session cancelled; card unaffected; release reservationId if present |
 
 **Layer 2 — Per-card sliding window (fraud detection)**
 
@@ -120,93 +300,80 @@ Two independent layers protect against accidental retry and card theft probing.
 |------|-------|
 | Redis key | `otp:card:fail:{cardId}` (TTL 900s / 15 min) |
 | Threshold | **5 failures within 15 minutes** (across any challengeRef) |
-| On threshold reached | Temporary card lock + publish `card.risk.otp-threshold-exceeded` → Risk Control |
-| Lock duration | Defined by Risk Control team |
+| On threshold reached | Card frozen (`status = FROZEN`) + Kafka `card.risk.otp-threshold-exceeded` + release reservationId |
 
 Each failure increments **both** counters simultaneously.
 
-### 2.4 Card Data Rules
+---
 
-See `guideline/6-pcidss.md` §2.2 for the full combineKey / encryptedCard specification.
+## 5. Mock NCCC (Development & Testing)
 
-- Decrypted card data lives **in JVM Heap only** — never serialized or persisted
-- CVV discarded immediately after authorization
-- PAN stored as masked format only: `****-****-****-1234`
+Mock NCCC is a **development-only** service that bridges BFF to card-service by simulating NCCC behavior.
+
+**card-plain internal endpoint** (`GET /card-service/internal/cards/{cardId}/plain`):
+- Dev/mock profile only; Nginx blocks `/internal/` from external traffic
+- Returns `{ pan, expiryMMYY, cvvItoken }` in plaintext from DB
+- Spec: [spec/card-service/card-plain.md](../spec/card-service/card-plain.md)
+
+**encryptedCard composition:**
+```
+encryptedCard = AES-256-GCM(
+  plaintext: JSON{ pan, expiryMMYY, cvvItoken },
+  key: MOCK_COMBINE_KEY,
+  iv: randomly generated, prepended to ciphertext
+)
+```
+
+**MOCK_COMBINE_KEY** is a fixed 256-bit key in `application-dev.yml`. In production, the real combineKey is assembled from 3 encrypted source keys in `card_key_parts` DB table. See [guideline/14-3ds-combine-key.md](14-3ds-combine-key.md).
 
 ---
 
-## 3. Mock NCCC (Development & Testing)
+## 6. Post-Auth Async Processing
 
-Mock NCCC is a **development-only** service that simulates NCCC's inbound authorization calls, enabling end-to-end testing without a real NCCC connection.
+After `txn.card.authorized` is published to Kafka, three independent consumers process it in parallel (fan-out pattern).
 
-### 3.1 Architecture
+### 6.1 Kafka Payload — `txn.card.authorized`
 
-```
-App
-  │  POST /api/v1/card/pay  (via BFF)
-  ↓
-Mock NCCC Service
-  ├─ Calls Card Service: POST /card/auth/authorize
-  │     ← CHALLENGE_REQUIRED + challengeRef + pointsPreview
-  └─ Returns challengeRef + pointsPreview to App
-
-App displays LinePay-style points offset preview + OTP input screen
-  │  POST /api/v1/card/pay/confirm  (via BFF)
-  ↓
-Mock NCCC Service
-  └─ Calls Card Service: POST /card/auth/verify-challenge
-        ← APPROVED / DECLINED
-
-Mock NCCC returns final result to App
+```json
+{
+  "txnId": "Snowflake ID",
+  "userId": 123,
+  "cardId": 456,
+  "cardType": "OVERSEAS",
+  "maskedPan": "****-****-****-1234",
+  "merchantId": "MERCHANT_001",
+  "txnAmount": 10000,
+  "txnCurrency": "USD",
+  "txnTwdBaseAmount": 316000,
+  "isOverseas": true,
+  "pointsToUse": 5000,
+  "txnTimestamp": "2026-03-30T10:00:00.000Z"
+}
 ```
 
-### 3.2 API Contract
+### 6.2 Points Service
 
-**POST /mock-nccc/pay** — Initiate payment
+- Kafka Consumer: `txn.card.authorized` (idempotent: `uk_pil_source_txn_id`)
+- Calculate `reward_points = floor(txnTwdBaseAmount × reward_rate)` (see §9)
+- Feign `wallet-service/credit(userId, rewardPoints)`
+- Insert `point_reward_batch` (status = PENDING; expires 1 year from txnTimestamp month-end)
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `cardId` | String | ✅ | Member's card identifier |
-| `amount` | BigDecimal | ✅ | Transaction amount |
-| `currency` | String | ✅ | `TWD` / `USD` / … |
-| `merchantId` | String | ✅ | Merchant identifier |
+### 6.3 Ledger Service
 
-Response:
+- Kafka Consumer: `txn.card.authorized` (idempotent: `ON DUPLICATE KEY IGNORE` on `idempotency_key`)
+- Insert `journal_entry` rows based on scenario (see §12.4)
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `challengeRef` | String | Present when 3DS required |
-| `status` | String | `CHALLENGE_REQUIRED` / `APPROVED` / `DECLINED` |
-| `pointsPreview.pointsToUse` | Integer | Server-computed from member preference |
-| `pointsPreview.cardAmount` | BigDecimal | Amount charged to card |
+### 6.4 Notification Service — Transaction Receipt
 
-**POST /mock-nccc/pay/confirm** — Submit OTP
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `challengeRef` | String | ✅ | From pay response |
-| `otp` | String | ✅ | 6-digit OTP from SMS |
-
-Response:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `authCode` | String | Present on approval |
-| `txnId` | String | Snowflake transaction ID |
-| `status` | String | `APPROVED` / `DECLINED` |
-| `declineReason` | String | Present on decline |
-
-### 3.3 Points Preview
-
-`pointsToUse` is calculated server-side in Phase 1 (from member preference) and surfaced as `pointsPreview` in the Mock NCCC response. The App uses this to display the offset summary screen — the value is **informational only**; the actual reserve is already set in Phase 1.
+- Kafka Consumer: `txn.card.authorized`
+- Internal forward to RabbitMQ queue `notification.txn.receipt`
+- Push notification + email with transaction details
 
 ---
 
-## 4. Points-First Preference
+## 7. Points-First Preference
 
-### 4.1 Preference Storage
-
-Points-first is a **per-member setting** managed by Wallet Service.
+### 7.1 Preference Storage
 
 **Table: `member_points_preference` (Wallet Service DB)**
 
@@ -217,58 +384,56 @@ Points-first is a **per-member setting** managed by Wallet Service.
 | `max_points_per_txn` | INT | Per-transaction cap (NULL = no cap) |
 | `updated_at` | DATETIME | |
 
-### 4.2 Auto-Calculation at Authorization
-
-Card Service reads the preference during Phase 1:
+### 7.2 Auto-Calculation at Authorization
 
 ```
 if points_first_enabled:
   pointsToUse = min(
     available_points_balance,
-    amount_in_twd,
+    txnTwdBaseAmount,
     max_points_per_txn ?? ∞
   )
 else:
   pointsToUse = 0
 
-cardAmount = amount_in_twd - pointsToUse
+estimatedTwdAmount = txnTwdBaseAmount - pointsToUse
 ```
 
-### 4.3 Points Exchange Rules
+### 7.3 Points Exchange Rules
 
 | Rule | Value |
 |------|-------|
 | Exchange rate | **1 point = NT$1** (1:1) |
 | Minimum | 1 point |
 | Maximum | Full amount (100% offset) |
-| Both `points_used` and `card_amount` | Must be recorded on the transaction |
+| Both `pointsToUse` and `estimatedTwdAmount` | Must be recorded on the transaction |
 
-### 4.4 Reserve-Confirm-Release
+### 7.4 Reserve-Confirm-Release
 
 ```
-Phase 1 (authorize):
-  Wallet Service.reserve(userId, pointsToUse)
+auth/authorize:
+  wallet-service.reserve(userId, pointsToUse)
   → available_balance -= pointsToUse
   → reserved_balance  += pointsToUse
-  Reserve TTL = 180s (aligns with OTP TTL, lazy cleanup on expiry)
+  Reserve TTL = 180s (aligned with OTP TTL; lazy cleanup on expiry)
 
-Phase 2 — APPROVED:
-  Wallet Service.confirmDeduct(reservationId)
+verify-challenge — APPROVED:
+  wallet-service.confirmDeduct(reservationId)
   → reserved_balance -= pointsToUse
 
 Compensation (OTP failure / DECLINED / TTL expiry):
-  Wallet Service.release(reservationId)
+  wallet-service.release(reservationId)
   → reserved_balance -= pointsToUse
   → available_balance += pointsToUse
 ```
 
 ---
 
-## 5. Saga Compensation Rules
+## 8. Saga Compensation Rules
 
 | Saga Step | Compensation Action | Trigger |
 |-----------|--------------------|---------|
-| Points reserve | `release(reservationId)` | OTP failure, auth failure, TTL expiry (lazy) |
+| Points reserve | `release(reservationId)` | Card validation fail, limit exceeded, OTP failure (≥3), card locked, session expiry (lazy) |
 | FX rate lock | Auto-expires via TTL | No active compensation needed |
 | Ledger entries | Write REVERSAL entries (never delete) | Refund flow (separate spec) |
 
@@ -276,26 +441,24 @@ Ledger entries are **immutable**. Compensation at the ledger level is always a n
 
 ---
 
-## 5. Reward Calculation Rules
+## 9. Reward Calculation Rules
 
-### 5.1 Reward Basis
+### 9.1 Reward Basis
 
-- Reward is calculated on **card_amount only** (points-offset portion is excluded)
-- Result is **floor (truncate)** — no rounding up
-- For foreign currency transactions, use the **TWD-converted card amount** as the basis
+- Reward is calculated on `txnTwdBaseAmount` (points-offset portion excluded)
+- Result is **floor (truncate)** — no rounding
+- For foreign currency: use the TWD-converted base amount (`twd_base`, excluding FX fee)
 
 ```
-reward_points = floor(card_amount_twd × reward_rate)
+reward_points = floor(txnTwdBaseAmount × reward_rate)
 
-Example: card_amount = 60, reward_rate = 2%
+Example: txnTwdBaseAmount = 60, reward_rate = 2%
   60 × 0.02 = 1.2 → floor → 1 point
 ```
 
-### 5.2 Reward Plan (MCC-based)
+### 9.2 Reward Plan (MCC-based)
 
-Reward rates are stored in the `reward_plan` table (Points Service DB) and configurable via back-office. The management UI is a future feature; the table must exist from day one.
-
-**Cache loading strategy:** Points Service loads all active reward plan rows into an in-memory `Map<String, BigDecimal>` (keyed by `mcc_code`) at startup (`ApplicationReadyEvent`). The map is refreshed only when a plan record is created or updated (cache invalidation on write). Read path never hits the DB.
+Reward rates are stored in `reward_plan` (Points Service DB). Loaded into in-memory `Map<String, BigDecimal>` at startup; invalidated on write. Read path never hits DB. If no MCC match, fall back to `mcc_code = 'DEFAULT'`.
 
 **Table: `reward_plan`**
 
@@ -303,17 +466,14 @@ Reward rates are stored in the `reward_plan` table (Points Service DB) and confi
 |--------|------|-------------|
 | `plan_id` | BIGINT PK | Snowflake |
 | `mcc_code` | VARCHAR(10) | MCC code; `DEFAULT` for catch-all |
-| `reward_rate` | DECIMAL(5,4) | e.g., `0.0200` for 2% |
-| `description` | VARCHAR(100) | Human-readable label |
-| `effective_from` | DATE | Plan effective date |
-| `effective_to` | DATE | Plan expiry date (null = no expiry) |
+| `reward_rate` | DECIMAL(5,4) | e.g., `0.0200` = 2% |
+| `effective_from` | DATE | Plan start date |
+| `effective_to` | DATE | Plan end date (null = no expiry) |
 | `created_at` | DATETIME | |
 
-Initial MCC rates are seeded via Flyway DML. If no MCC match is found, fall back to `mcc_code = 'DEFAULT'`.
+### 9.3 Reward Point Batch
 
-### 5.3 Reward Point Batch
-
-Every reward issuance creates one `point_reward_batch` record. Each batch tracks its own remaining balance and expiry independently, enabling accurate FIFO deduction and expiry management.
+Each reward issuance creates one `point_reward_batch` record with its own balance and expiry, enabling FIFO deduction and precise expiry management.
 
 **Table: `point_reward_batch`**
 
@@ -329,7 +489,6 @@ Every reward issuance creates one `point_reward_batch` record. Each batch tracks
 | `created_at` | DATETIME | |
 
 **Status transitions:**
-
 ```
 PENDING   →  CONFIRMED   (T+1 settlement)
 PENDING   →  CANCELLED   (refund before settlement)
@@ -339,189 +498,157 @@ CONFIRMED →  CANCELLED   (refund after settlement)
 
 ---
 
-## 6. Foreign Currency Rules
+## 10. Foreign Currency Rules
 
 | Rule | Value |
 |------|-------|
-| TWD transactions | **No handling fee** |
+| TWD transactions | No handling fee |
 | FX handling fee | **1.5%** of `twd_base`, added on top |
-| Rate lock | FX Service `lockRate()` called in Step 1; returns `fxRateId` (TTL: 10 min) |
 | Ledger currency | Always record in TWD; store original currency + rate for reference |
-| Reward basis | **`twd_base` only** — FX fee is excluded from reward calculation |
-| Merchant fee basis | **`twd_base` only** — FX fee is WillCard's own charge to the cardholder and does not form part of the merchant service; merchant settlement is calculated solely on `twd_base` |
+| Reward basis | `twd_base` only — FX fee excluded from reward |
+| Merchant fee basis | `twd_base` only — FX fee is charged to cardholder only |
 
 **FX amount calculation:**
 
 ```
 twd_base      = foreign_amount × fx_rate
 fx_fee        = floor(twd_base × 0.015)
-total_twd     = twd_base + fx_fee        ← amount charged to member's card
-reward_points = floor(twd_base × reward_rate)  ← reward based on twd_base, not total_twd
+total_twd     = twd_base + fx_fee        ← charged to member (estimatedTwdAmount)
+reward_points = floor(twd_base × reward_rate)
 ```
 
 Example: USD$100, rate 31.0, reward rate 1%
 ```
 twd_base      = 100 × 31.0  = 3,100
 fx_fee        = floor(3,100 × 0.015) = 46
-total_twd     = 3,100 + 46 = 3,146     ← member is charged TWD$3,146
-reward_points = floor(3,100 × 0.01)  = 31 points
+total_twd     = 3,100 + 46 = 3,146
+reward_points = floor(3,100 × 0.01) = 31 points
 ```
 
 ---
 
-## 7. Transaction Limits
+## 11. Transaction Limits
 
-Limits are enforced per card type and stored in `card_type_limit` (Card Service DB).
+Limits are enforced per card type, stored in `card_type_limit` (Card Service DB).
 
-| Default | Value |
-|---------|-------|
-| Single transaction | NT$100,000 |
-| Daily cumulative | NT$200,000 |
+| card_type | single_txn_limit | daily_limit |
+|-----------|-----------------|-------------|
+| CLASSIC | NT$100,000 | NT$200,000 |
+| OVERSEAS | NT$100,000 | NT$200,000 |
+| PREMIUM | NT$200,000 | NT$500,000 |
+| INFINITE | No limit | No limit |
 
-**Table: `card_type_limit`**
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | BIGINT PK | |
-| `card_type` | VARCHAR | e.g., `STANDARD`, `GOLD`, `PLATINUM` |
-| `single_txn_limit` | DECIMAL(15,2) | |
-| `daily_limit` | DECIMAL(15,2) | |
-| `currency` | VARCHAR(3) | `TWD` |
-| `updated_at` | DATETIME | |
-
-Card Service validates both limits before generating the OTP in Step 1.
+Limits are stored in TWD cents (`BIGINT`). `NULL` = no limit (INFINITE). Both limits are checked before OTP generation; if either fails, the request is declined before any points reserve.
 
 ---
 
-## 8. Double-Entry Ledger Rules
+## 12. Double-Entry Ledger Rules
 
-### 8.1 Principles
+### 12.1 Principles
 
 - Ledger entries are **immutable** — INSERT only, no UPDATE or DELETE
-- Every transaction produces a balanced set of DEBIT / CREDIT entries
+- Every transaction produces a balanced DEBIT / CREDIT entry set
 - Compensation is always a new REVERSAL entry set
 
-### 8.2 Account Structure
-
-**Assets (資產)**
+### 12.2 Account Structure
 
 | Code | Account | Description |
 |------|---------|-------------|
-| `1001` | Member Receivable（應收會員款）| Amount charged to the member's virtual card at authorization |
-| `1002` | Settlement Reserve（清算備付金）| Cash pool used for merchant settlement; debited at T+1 settlement |
+| `1001` | Member Receivable | Amount charged to the member's virtual card at authorization |
+| `1002` | Settlement Reserve | Cash pool; debited at T+1 settlement to merchant |
+| `2001` | Merchant Payable | Net amount owed to merchant (after fee); includes points-offset subsidy |
+| `2002` | Points Liability | Issued but unredeemed reward points (1 pt = NT$1) |
+| `3001` | Merchant Fee Income | Service fee on TWD transactions |
+| `3002` | FX Fee Income | 1.5% handling fee on foreign currency transactions |
+| `4001` | Reward Points Expense | Cost of issuing reward points |
+| `5001` | FX Gain/Loss | Exchange rate difference |
 
-**Liabilities (負債)**
-
-| Code | Account | Description |
-|------|---------|-------------|
-| `2001` | Merchant Payable（應付特店款）| Net amount owed to merchant after deducting service fee; also receives points-offset subsidy |
-| `2002` | Points Liability（點數負債）| Issued but unredeemed reward points (1 pt = NT$1); drawn down on redemption |
-
-**Revenue (收入)**
-
-| Code | Account | Description |
-|------|---------|-------------|
-| `3001` | Merchant Fee Income（特店手續費收入）| Service fee charged to merchant on every TWD transaction |
-| `3002` | FX Fee Income（外幣手續費收入）| 1.5% handling fee on foreign currency transactions |
-
-**Expense (費用)**
-
-| Code | Account | Description |
-|------|---------|-------------|
-| `4001` | Reward Points Expense（點數回饋費用）| Cost of issuing reward points to members |
-
-**Other (其他)**
-
-| Code | Account | Description |
-|------|---------|-------------|
-| `5001` | FX Gain/Loss（匯差損益）| Exchange rate difference when WillCard holds FX position |
-
-### 8.3 Journal Entry Types
+### 12.3 Journal Entry Types
 
 | `journal_type` | Trigger |
 |---------------|---------|
-| `AUTHORIZATION` | NCCC authorization success |
-| `SETTLEMENT` | T+1 batch settlement — cash moves: DR 2001 / CR 1002 |
+| `AUTHORIZATION` | Kafka `txn.card.authorized` |
+| `SETTLEMENT` | T+1 batch — DR 2001 / CR 1002 |
 | `REVERSAL` | Refund (separate spec) |
-| `REWARD` | Reward points issuance (async, via Kafka event) |
+| `REWARD` | Reward points issuance (async, via Kafka) |
 
-### 8.4 Entry Examples
+### 12.4 Entry Examples
 
 **Case 1: TWD NT$100, no offset, reward 1%, merchant fee 3%**
 
-| Debit | Amt | Credit | Amt | Note |
-|-------|-----|--------|-----|------|
-| Member Receivable (1001) | 100.00 | Merchant Payable (2001) | 97.00 | Authorization |
-| | | Merchant Fee Income (3001) | 3.00 | |
-| Reward Expense (4001) | 1.00 | Points Liability (2002) | 1.00 | 1 point — floor(100×1%) |
+| Debit | Amt | Credit | Amt |
+|-------|-----|--------|-----|
+| Member Receivable (1001) | 100 | Merchant Payable (2001) | 97 |
+| | | Merchant Fee Income (3001) | 3 |
+| Reward Expense (4001) | 1 | Points Liability (2002) | 1 |
 
-**Case 2: TWD NT$100, 34 pts offset + NT$66 card, reward 1%, merchant fee 3%**
+**Case 2: TWD NT$100, 34 pts offset + NT$66 card, reward 1%, fee 3%**
 
-| Debit | Amt | Credit | Amt | Note |
-|-------|-----|--------|-----|------|
-| Member Receivable (1001) | 66.00 | Merchant Payable (2001) | 64.02 | Card portion |
-| | | Merchant Fee Income (3001) | 1.98 | fee on card portion |
-| Points Liability (2002) | 34.00 | Merchant Payable (2001) | 34.00 | Points subsidy to merchant |
-| Reward Expense (4001) | 0.00 | Points Liability (2002) | 0.00 | floor(66×1%) = 0 pts |
+| Debit | Amt | Credit | Amt |
+|-------|-----|--------|-----|
+| Member Receivable (1001) | 66 | Merchant Payable (2001) | 64.02 |
+| | | Merchant Fee Income (3001) | 1.98 |
+| Points Liability (2002) | 34 | Merchant Payable (2001) | 34 |
+| Reward Expense (4001) | 0 | Points Liability (2002) | 0 |
 
-> Merchant still receives NT$100 in total (64.02 + 1.98 fee retained + 34.00 subsidy = NT$100 gross).
+> Merchant receives NT$100 total (64.02 + 1.98 retained + 34.00 subsidy).
 
-**Case 3: Foreign USD$100, rate 31.0, reward 1%, merchant fee 3%**
-
+**Case 3: Foreign USD$100, rate 31.0, reward 1%, fee 3%**
 ```
-twd_base = 3,100 | fx_fee = 46 | total_twd = 3,146 | reward = floor(3,100×1%) = 31 pts
+twd_base = 3,100 | fx_fee = 46 | total_twd = 3,146 | reward = 31 pts
 ```
 
-| Debit | Amt | Credit | Amt | Note |
-|-------|-----|--------|-----|------|
-| Member Receivable (1001) | 3,146.00 | Merchant Payable (2001) | 3,007.00 | twd_base × 0.97 |
-| | | Merchant Fee Income (3001) | 93.00 | twd_base × 3% |
-| | | FX Fee Income (3002) | 46.00 | twd_base × 1.5% |
-| Reward Expense (4001) | 31.00 | Points Liability (2002) | 31.00 | floor(twd_base × 1%) |
+| Debit | Amt | Credit | Amt |
+|-------|-----|--------|-----|
+| Member Receivable (1001) | 3,146 | Merchant Payable (2001) | 3,007 |
+| | | Merchant Fee Income (3001) | 93 |
+| | | FX Fee Income (3002) | 46 |
+| Reward Expense (4001) | 31 | Points Liability (2002) | 31 |
 
-### 8.5 `journal_entry` Schema
+### 12.5 `journal_entry` Schema
 
 | Column | Type | Note |
 |--------|------|------|
 | `entry_id` | BIGINT PK | Snowflake |
-| `idempotency_key` | VARCHAR(100) UNIQUE | `{kafka_message_key}_{entry_seq}` — prevents duplicate writes on Kafka consumer retry |
+| `idempotency_key` | VARCHAR(100) UNIQUE | `{messageKey}_{entry_seq}` — prevents duplicate on Kafka retry |
 | `txn_id` | BIGINT | Source transaction |
-| `journal_type` | VARCHAR(20) | See §8.3 |
+| `journal_type` | VARCHAR(20) | See §12.3 |
 | `entry_type` | VARCHAR(10) | `DEBIT` / `CREDIT` |
-| `account_code` | VARCHAR(10) | See §8.2 |
+| `account_code` | VARCHAR(10) | See §12.2 |
 | `amount` | DECIMAL(15,4) | |
 | `currency` | VARCHAR(3) | `TWD`, `USD`, etc. |
-| `fx_rate` | DECIMAL(10,6) | `1.0` for TWD transactions |
+| `fx_rate` | DECIMAL(10,6) | `1.0` for TWD |
 | `amount_twd` | DECIMAL(15,4) | TWD equivalent |
 | `memo` | VARCHAR(255) | |
 | `created_at` | DATETIME(3) | Immutable — no `updated_at` |
 
-**Idempotency design:**
-- The Kafka event payload for `txn.card.authorized` must include a stable `messageKey` (e.g., Snowflake-generated at event publish time).
-- Ledger Service assigns `entry_seq` (0, 1, 2 …) to each entry within one event, forming `idempotency_key = {messageKey}_{entry_seq}`.
-- On retry, the `INSERT` hits the unique constraint and is discarded — no duplicate entries, no exception propagation needed (handle as upsert-ignore or catch duplicate key).
-
 ---
 
-## 9. Operation Log Level
+## 13. Operation Log Level
 
-Both APIs are **L1** (financial operation). See `guideline/7-spec-guideline.md` §4.2 for the full `OperationLogEvent` specification.
+Both BFF APIs are **L1** (financial operations). See `guideline/7-spec-guideline.md` §4.2 for the `OperationLogEvent` specification.
 
 | API | Kafka Topic |
 |-----|------------|
-| `card-pay` (Step 1) | `operation-log.card.pay` |
-| `card-pay/confirm` (Step 2) | `operation-log.card.pay-confirm` |
+| `POST /api/v1/card/pay` | `operation-log.card.pay` |
+| `POST /api/v1/card/pay/confirm` | `operation-log.card.pay-confirm` |
 
 Every call — success or failure — must publish an event.
 
 ---
 
-## 10. Out of Scope
+## 14. Card Data Security Rules
 
-The following are explicitly **not** covered by this chapter and will be defined in separate specs:
+- Decrypted card data (`pan`, `expiryMMYY`, `cvvItoken`) exists **in JVM Heap only** for the lifetime of a single request
+- Must not appear in any log, serialized object, or persisted record
+- PAN byte array is zero-filled in a `finally` block after use (Step 24 in authorize)
+- `cvvItoken` is never regenerated at auth time — it is fetched from DB via `encryptedCard` and compared directly
+- See [guideline/6-pcidss.md](6-pcidss.md) and [guideline/14-3ds-combine-key.md](14-3ds-combine-key.md)
+
+---
+
+## 15. Out of Scope
 
 - **Refund flow** — uses REVERSAL journal entries; defined in `11-refund-flow`
 - **Reward plan back-office management** — future feature
-- **Card type management** — defined with Card Service onboarding spec
-
-Next chapter: [Refund Flow](/guideline/11-refund-flow.md) *(pending)*
+- **Production NCCC integration** — mutual TLS, real card data path; defined in production runbook

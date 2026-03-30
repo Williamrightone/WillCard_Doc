@@ -24,7 +24,8 @@ CREATE TABLE `card` (
   `status`             VARCHAR(20)   NOT NULL COMMENT 'PENDING / ACTIVE / FROZEN / CANCELLED',
   `pan_encrypted`      VARCHAR(512)  NOT NULL COMMENT 'AES-256-GCM encrypted full PAN (PCI DSS)',
   `pan_masked`         VARCHAR(20)   NOT NULL COMMENT 'Display-safe masked PAN, e.g. ****-****-****-1234',
-  `pan_hash`           VARCHAR(64)   NOT NULL COMMENT 'HMAC-SHA256 of full PAN; used by Phase 7 issuer auth for PAN-to-member lookup',
+  `pan_hash`           VARCHAR(64)   NOT NULL COMMENT 'HMAC-SHA256 of full PAN; used by Phase 8 issuer auth for PAN-to-member lookup',
+  `cvv_itoken`         VARCHAR(64)   NOT NULL COMMENT 'HMAC-SHA256 of CVV; CVV_HMAC_KEY from env/KMS; used by Phase 8 for CVV verification without storing raw CVV (PCI DSS)',
   `cardholder_name_zh` VARCHAR(512)  NOT NULL COMMENT 'AES-256-GCM encrypted Chinese cardholder name',
   `cardholder_name_en` VARCHAR(512)  NOT NULL COMMENT 'AES-256-GCM encrypted English cardholder name (printed on card)',
   `expiry_date`        VARCHAR(512)  NOT NULL COMMENT 'AES-256-GCM encrypted expiry in MMYY format; apply date + 5 years',
@@ -42,6 +43,22 @@ CREATE TABLE `card` (
 > **Application-layer uniqueness constraint:** Only one non-cancelled card per `(user_id, card_type)` is allowed. Enforced by Step 1 of `CardApplyUseCaseImpl` (query WHERE `status != 'CANCELLED'`). No DB-level partial unique index.
 
 > **Encryption note:** `pan_encrypted`, `cardholder_name_zh`, `cardholder_name_en`, `expiry_date` are all AES-256-GCM ciphertext. Decrypted values exist only in JVM heap during request processing and must never be serialized, logged, or persisted.
+
+> **CVV iToken note:** `cvv_itoken` is a one-way HMAC-SHA256 token — raw CVV is never stored. No unique index on `cvv_itoken` (3-digit CVVs have only 1,000 possible values; uniqueness is not meaningful). Lookup is always by `card_id`, not by iToken.
+
+---
+
+### `card` — Amendment Migration
+
+> **Migration:** `V1.0.5__add_card_cvv_itoken.sql`
+> **Last updated:** 2026-03
+
+```sql
+ALTER TABLE `card`
+  ADD COLUMN `cvv_itoken` VARCHAR(64) NOT NULL
+    COMMENT 'HMAC-SHA256 of CVV; CVV_HMAC_KEY from env/KMS; never stores raw CVV (PCI DSS)'
+  AFTER `pan_hash`;
+```
 
 ---
 
@@ -137,3 +154,48 @@ VALUES
 >    AND (effective_to IS NULL OR effective_to >= CURDATE())
 >  ORDER BY effective_from ASC;
 > ```
+
+---
+
+### `card_key_parts`
+
+> **Source migration:** `V5.0.0__create_card_key_parts_table.sql`
+> **Seed migration:** `V5.0.1__seed_card_key_parts.sql`
+> **Last updated:** 2026-03
+> **Mutability:** Rows are updated in-place on each source key rotation; never inserted or deleted at runtime.
+
+```sql
+CREATE TABLE `card_key_parts` (
+  `part_seq`        INT           NOT NULL COMMENT 'PK: source key sequence (1, 2, or 3)',
+  `encrypted_part`  VARCHAR(512)  NOT NULL COMMENT 'AES-256-GCM encrypted 256-bit source key; master key is injected from env/KMS and never stored in DB',
+  `updated_at`      DATETIME(3)   NOT NULL COMMENT 'Timestamp of the last key injection or rotation',
+  PRIMARY KEY (`part_seq`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4
+  COLLATE = utf8mb4_unicode_ci;
+```
+
+> **Exactly 3 rows:** `part_seq` 1, 2, 3. `part_seq` serves as the natural PK; no surrogate key.
+>
+> **Purpose:** Stores the three encrypted source keys that are XOR-combined on startup to produce the
+> in-memory `combineKey`, used for AES-256-GCM decryption of NCCC-encrypted card data during 3DS authorization.
+>
+> **No created_at:** Rows are seeded once at deployment and updated in-place on rotation.
+> `updated_at` alone provides the audit trail for key rotation history.
+>
+> **Master key:** Never stored in this table. Injected at runtime from KMS or environment variable.
+>
+> **Security:** `encrypted_part` values must never be logged or exposed in API responses.
+> See [guideline/14-3ds-combine-key.md](../guideline/14-3ds-combine-key.md) for the full key architecture.
+
+**Seed structure (`V5.0.1__seed_card_key_parts.sql`):**
+
+```sql
+-- Production: replace ciphertext values with actual AES-256-GCM(sourceKeyN, MASTER_KEY)
+-- Dev/test:   use values whose XOR equals the mock-combine-key from application-dev.yml
+INSERT INTO `card_key_parts` (`part_seq`, `encrypted_part`, `updated_at`)
+VALUES
+  (1, '<AES-256-GCM encrypted sourceKey1>', NOW(3)),
+  (2, '<AES-256-GCM encrypted sourceKey2>', NOW(3)),
+  (3, '<AES-256-GCM encrypted sourceKey3>', NOW(3));
+```

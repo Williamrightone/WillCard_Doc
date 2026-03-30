@@ -48,18 +48,17 @@
 ### 發放公式
 
 ```
-reward_points = floor(txn_twd_base_amount × final_rate)
-
-final_rate = base_rate + mcc_bonus + merchant_bonus
+reward_points = floor(txn_twd_base_amount × base_rate)
 ```
 
-| 層級 | 來源 |
+| 變數 | 來源 |
 |------|------|
-| `base_rate` | `card_type_limit.domestic_reward_rate` 或 `overseas_reward_rate` |
-| `mcc_bonus` | `reward_plan`（Phase 3） |
-| `merchant_bonus` | `card_type_merchant_benefit`（Phase 1） |
+| `txn_twd_base_amount` | 交易金額（TWD 分），不含匯率手續費 |
+| `base_rate` | `card_type_limit.domestic_reward_rate` 或 `overseas_reward_rate`（依交易幣別決定使用國內或海外費率） |
 
 > 點數一律以**不含跨國手續費的 TWD 等值基礎金額**計算。
+
+> **未來擴充：** 待 MCC 獎勵計畫與商家加成功能引入後，公式將擴充為 `floor(txn_twd_base_amount × (base_rate + mcc_bonus + merchant_bonus))`。請參閱 [guideline/13-reward-plan-zh-tw.md](/guideline/13-reward-plan-zh-tw.md) 第 8 節。
 
 ---
 
