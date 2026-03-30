@@ -24,14 +24,18 @@ This chapter describes the system architecture of WillCard, including the archit
 | 3 | Wallet Service | Domain | TWD points balance, top-up commands |
 | 4 | Points Service | Domain | Points account, reward calculation, redemption, expiry management |
 | 5 | FX Service | Utility | Exchange rate query and locking (stateless calculator — no account ownership) |
-| 6 | Transaction Orchestrator | Core | Saga coordination, compensating transactions, idempotency control |
+| 6 | Transaction Orchestrator | Core | Saga coordination, compensating transactions, idempotency control; orchestrates FX conversion, wallet reserve/confirm/release, and Kafka publish for card payment flow |
 | 7 | Ledger Service | Core | Double-entry ledger, journal entries, immutable |
 | 8 | Reconciliation Service | Core | T+0 real-time reconciliation, T+1 batch settlement, discrepancy reports; Operation Log audit consumer (Kafka → DB) |
 | 9 | Notification Service | Infra | OTP SMS, transaction push notifications, email receipts |
 | 10 | Auth Service | Domain | Login, OAuth, user authentication and authorization |
+| 11 | Mock NCCC | Mock (Dev only) | Simulates NCCC card network behavior in the development environment; called by Transaction Orchestrator; retrieves plain card data from card-service internal endpoint, assembles `encryptedCard`, and forwards to `card-service auth/authorize`; replaced by real NCCC integration in production |
 
 > **FX Service positioning:**
 > FX Service is a stateless exchange rate utility. It holds no accounts and participates in no Saga state management. Its sole responsibility is rate query, locking, and conversion calculation.
+
+> **Mock NCCC positioning:**
+> In production, the card network (NCCC) routes inbound authorization requests to WillCard as the issuer. In this project's development environment, the direction is reversed: Transaction Orchestrator actively calls Mock NCCC, which simulates the card network's role of assembling and forwarding encrypted card data to card-service. Mock NCCC is a dev-only service and is not deployed in production.
 
 ```mermaid
 graph TB
@@ -60,9 +64,13 @@ graph TB
     end
 
     subgraph Core_Layer["Core Engine"]
-        ORCH[Transaction Orchestrator<br/>Saga · Compensate · Idempotency]
+        ORCH[Transaction Orchestrator<br/>Saga · Compensate · Idempotency<br/>FX · Wallet Saga · Kafka Publish]
         LEDGER[Ledger Service<br/>Double-entry · Immutable]
         RECON[Reconciliation<br/>T+0 · T+1 Batch · Audit Log]
+    end
+
+    subgraph Mock_Layer["Mock Services (Dev Only)"]
+        MNCCC[Mock NCCC<br/>Simulates card network<br/>Assembles encryptedCard]
     end
 
     subgraph Event_Bus["Kafka Event Bus"]
@@ -85,7 +93,8 @@ graph TB
     BFF -->|X-User-Id, X-User-Role header| FX
     BFF -->|X-User-Id, X-User-Role header| ORCH
 
-    ORCH --> CARD
+    ORCH -->|Dev: card payment flow| MNCCC
+    MNCCC --> CARD
     ORCH --> WALLET
     ORCH --> FX
     ORCH --> LEDGER

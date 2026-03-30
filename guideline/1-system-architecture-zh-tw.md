@@ -24,14 +24,18 @@
 | 3 | Wallet Service | Domain | 台幣點數餘額、儲值指令 |
 | 4 | Points Service | Domain | 點數帳戶、回饋計算、兌換、到期管理 |
 | 5 | FX Service | Utility | 匯率查詢、鎖定匯率（無狀態計算工具，不持有帳戶） |
-| 6 | Transaction Orchestrator | Core | Saga 協調、補償交易、冪等控制 |
+| 6 | Transaction Orchestrator | Core | Saga 協調、補償交易、冪等控制；負責刷卡流程的 FX 換算、Wallet Reserve／Confirm／Release、Kafka 發布 |
 | 7 | Ledger Service | Core | Double-entry 帳本、journal entries、不可變 |
 | 8 | Reconciliation Service | Core | T+0 即時對帳、T+1 批次清算、差異報表；Operation Log 稽核消費者（Kafka → DB） |
 | 9 | Notification Service | Infra | OTP SMS、交易推播、Email receipt |
 | 10 | Auth Service | Domain | Login, Oauth, 用戶授權與認證 |
+| 11 | Mock NCCC | Mock（僅 Dev） | 模擬 NCCC 卡組織行為；由 Transaction Orchestrator 呼叫；從 card-service 內部端點取得明文卡片資料、組裝 `encryptedCard`，再轉發至 `card-service auth/authorize`；正式環境以真實 NCCC 整合取代 |
 
 > **FX Service 定位說明：**
 > FX Service 是無狀態的匯率計算工具，不持有任何帳戶，不參與 Saga 狀態管理。職責僅限於匯率資料的查詢、鎖定與換算計算，歸類為 Utility Service 而非 Domain Service.
+
+> **Mock NCCC 定位說明：**
+> 正式環境中，卡組織（NCCC）會將授權請求向內路由至 WillCard（作為 Issuer）。本專案開發環境採用 Mock NCCC，流向相反：Transaction Orchestrator 主動呼叫 Mock NCCC，由 Mock NCCC 模擬卡組織角色，組裝加密卡片資料並轉發至 card-service。Mock NCCC 僅在開發環境部署，不進入正式環境。
 
 ```mermaid
 graph TB
@@ -60,9 +64,13 @@ graph TB
     end
 
     subgraph Core_Layer["核心引擎"]
-        ORCH[Transaction Orchestrator<br/>Saga · 補償交易 · 冪等控制]
+        ORCH[Transaction Orchestrator<br/>Saga · 補償交易 · 冪等控制<br/>FX · Wallet Saga · Kafka 發布]
         LEDGER[Ledger Service<br/>複式記帳 · 不可變]
         RECON[Reconciliation<br/>T+0 · T+1 批次 · 稽核日誌]
+    end
+
+    subgraph Mock_Layer["Mock 服務（僅 Dev）"]
+        MNCCC[Mock NCCC<br/>模擬卡組織行為<br/>組裝 encryptedCard]
     end
 
     subgraph Event_Bus["Kafka 事件匯流排"]
@@ -85,7 +93,8 @@ graph TB
     BFF -->|X-User-Id, X-User-Role header| FX
     BFF -->|X-User-Id, X-User-Role header| ORCH
 
-    ORCH --> CARD
+    ORCH -->|Dev: 刷卡交易流程| MNCCC
+    MNCCC --> CARD
     ORCH --> WALLET
     ORCH --> FX
     ORCH --> LEDGER

@@ -90,63 +90,134 @@ isOverseas = false → domestic_reward_rate
 
 ## Phase 6 — BFF Card Pay API（App 入口）
 
-**目標：** 對 App 暴露刷卡與 OTP 確認兩支入口，呼叫 Mock NCCC
+**目標：** 對 App 暴露刷卡與 OTP 確認兩支入口，呼叫 Transaction Orchestrator
+
+> **架構說明：** BFF 不直接呼叫 Mock NCCC，而是呼叫 Transaction Orchestrator，由 ORCH 統一協調後續的 FX 換算、Wallet Saga 與 Mock NCCC 呼叫。
 
 - [ ] **`POST /api/v1/card/pay`**（Nginx strip → BFF `/card/pay`）
   - Request：`{ cardId, amount, currency, merchantId, usePoints: Boolean }`
-  - JWT 驗證 + X-User-Id header 注入
-  - 冪等控制（BFF Redis idempotency key，TTL 60s）
-  - Feign → `POST /mock-nccc/pay`
+  - JWT 驗證 + X-Member-Id header 注入
+  - 冪等控制（BFF Redis `bff:pay:idem:{userId}:{idempotencyKey}`，TTL 60s）
+  - Feign → `POST /txn-orch/card/pay`（Transaction Orchestrator）
   - Response：`{ challengeRef, pointsToUse, estimatedTwdAmount }`
   - Operation Log L1：Kafka `operation-log.card.pay`
-  - spec: `spec/mobile-bff/card-pay.md`（待補）
+  - spec: `spec/mobile-bff/card-pay.md` ✅
 
 - [ ] **`POST /api/v1/card/pay/confirm`**（Nginx strip → BFF `/card/pay/confirm`）
   - Request：`{ challengeRef, otp }`
-  - Feign → `POST /mock-nccc/pay/confirm`
-  - Response：`{ result: APPROVED | DECLINED, reason? }`
+  - Feign → `POST /txn-orch/card/pay/confirm`（Transaction Orchestrator）
+  - Response：`{ result: APPROVED | DECLINED, txnId?, reason?, remainingAttempts? }`
   - Operation Log L1：Kafka `operation-log.card.pay-confirm`
-  - spec: `spec/mobile-bff/card-pay-confirm.md`（待補）
-
-- [ ] Error mapping：Card Service 錯誤碼（CA000xx）→ BFF 對外錯誤碼
+  - spec: `spec/mobile-bff/card-pay-confirm.md` ✅
 
 ---
 
-## Phase 7 — Mock NCCC Service（開發環境）
+## Phase 7 — Transaction Orchestrator + Mock NCCC（開發環境）
 
-**目標：** 模擬 NCCC 行為，橋接 BFF ↔ card-service，讓整體流程可端對端測試
+**目標：** ORCH 統一協調完整交易 Saga；Mock NCCC 模擬卡組織行為
 
-> **設計說明：** 真實環境中 App 直接與 NCCC iframe 互動，NCCC 收到使用者輸入的卡片資料後以 combineKey 加密再呼叫我方 card-service。
-> Mock NCCC 代為模擬此行為：從 card-service 取得卡片明文資料 → 以固定 mock combineKey 加密 → 呼叫 auth/authorize。
-
-- [ ] **`POST /mock-nccc/pay`**
-  - Request（來自 BFF）：`{ cardId, amount, currency, merchantId, usePoints }`
-  - 呼叫 card-service 內部 API 取得 `{ pan, expiryMMYY, cvvItoken }`
-  - 以 `MOCK_COMBINE_KEY` 組裝 `encryptedCard`（AES-256-GCM）：`{ pan, expiryMMYY, cvvItoken }`
-  - Feign → `POST /card-service/auth/authorize`（encryptedCard、amount、currency、merchantId、usePoints）
-  - 回傳 `{ challengeRef, pointsToUse, estimatedTwdAmount }` 給 BFF
-  - spec: `spec/mock-nccc/pay.md`（待補）
-
-- [ ] **`POST /mock-nccc/pay/confirm`**
-  - Request（來自 BFF）：`{ challengeRef, otp }`
-  - Feign → `POST /card-service/auth/verify-challenge`
-  - 回傳最終結果給 BFF：`{ result: APPROVED | DECLINED, reason? }`
-  - spec: `spec/mock-nccc/pay-confirm.md`（待補）
-
-- [ ] **card-service 內部卡片查詢端點**（供 Mock NCCC 取得明文卡片資料）
-  - `GET /card-service/internal/cards/{cardId}/plain`（內部路由，Nginx 封鎖外部流量）
-  - Response：`{ pan, expiryMMYY, cvvItoken }`（明文，僅 dev/mock profile 啟用；cvvItoken 從 DB 讀出，供 Mock NCCC 組裝 encryptedCard 使用）
-  - spec: `spec/card-service/card-plain.md`（待補）
+> **ORCH 職責：** FX 換算、Wallet reserve/confirm/release、Saga 狀態管理、Kafka 發布。
+> **Mock NCCC 職責：** 組裝 encryptedCard、呼叫 card-service auth/authorize 與 verify-challenge。
+> **card-service 職責：** 驗卡、限額核查、OTP 生成與驗證——**不再呼叫 FX 或 Wallet Service**。
 
 ---
 
-## Phase 8 — card-service auth/authorize（OTP 生成 + 點數預授權 + SMS）
+### Phase 7a — Transaction Orchestrator
 
-**目標：** 實作 NCCC 呼叫的主要授權端點，完成解密驗卡、限額核查、點數預留、OTP 發送
+#### ORCH Saga State（Redis，key: `saga:{challengeRef}`，TTL 180s）
+
+```json
+{
+  "userId": 123,
+  "cardId": 456,
+  "amount": 10000,
+  "currency": "USD",
+  "txnTwdBaseAmount": 316000,
+  "isOverseas": true,
+  "merchantId": "MERCHANT_001",
+  "pointsToUse": 5000,
+  "reservationId": 789
+}
+```
+
+> `reservationId`：若 pointsToUse = 0 則為 null。
+
+#### UseCase Flow — `POST /txn-orch/card/pay`（Leg 1）
+
+| Step | 說明 |
+|------|------|
+| 1 | 幣別判斷：`TWD` → `txnTwdBaseAmount = amount`；外幣 → Feign `POST /fx-service/convert` → `txnTwdBaseAmount` |
+| 2 | `isOverseas = (currency != TWD)` |
+| 3 | 若 `usePoints`：Feign `wallet-service GET /balance/{userId}` → `availableBalance`；`pointsToUse = min(availableBalance, txnTwdBaseAmount)`；否則 `pointsToUse = 0` |
+| 4 | Feign → `POST /mock-nccc/pay`（`{ cardId, amount, currency, txnTwdBaseAmount, merchantId }`）→ 得到 `challengeRef` |
+| 5 | 若 Step 4 成功且 `pointsToUse > 0`：Feign `wallet-service reserve(userId, pointsToUse)` → `reservationId` |
+| 6 | 儲存 Saga State（key: `saga:{challengeRef}`，TTL 180s） |
+| 7 | Response：`{ challengeRef, pointsToUse, estimatedTwdAmount: txnTwdBaseAmount }` |
+
+> Step 4 失敗（驗卡失敗、限額超過）→ 直接回傳錯誤，無需 release（Step 5 尚未執行）。
+> Step 5 失敗（wallet reserve 失敗）→ 回傳錯誤（OTP Session 存在但無 reservation；TTL 自然過期）。
+
+#### UseCase Flow — `POST /txn-orch/card/pay/confirm`（Leg 2）
+
+| Step | 說明 |
+|------|------|
+| 1 | 讀取 Saga State `saga:{challengeRef}`；不存在 → 回傳 `DECLINED + SESSION_EXPIRED` |
+| 2 | Feign → `POST /mock-nccc/pay/confirm`（`{ challengeRef, otp }`）→ 得到 `{ result, txnId?, cardType?, maskedPan?, reason?, remainingAttempts? }` |
+| **result = APPROVED** | |
+| 3 | 若 `reservationId != null`：Feign `wallet-service confirmDeduct(reservationId)` |
+| 4 | Kafka Publish `txn.card.authorized`（從 Saga State + verify-challenge response 組裝，見 Kafka Payload） |
+| 5 | DEL `saga:{challengeRef}` |
+| 6 | Response：`{ result: APPROVED, txnId }` |
+| **result = DECLINED + SESSION_VOIDED 或 CARD_LOCKED** | |
+| 7 | 若 `reservationId != null`：Feign `wallet-service release(reservationId)` |
+| 8 | DEL `saga:{challengeRef}` |
+| 9 | Response：`{ result: DECLINED, reason }` |
+| **result = DECLINED + OTP_FAILED** | |
+| 10 | 不執行 release（Session 仍有效，Reservation 繼續持有） |
+| 11 | Response：`{ result: DECLINED, reason: OTP_FAILED, remainingAttempts }` |
+
+- spec: `spec/txn-orch/card-pay.md`（待補）
+- spec: `spec/txn-orch/card-pay-confirm.md`（待補）
+
+---
+
+### Phase 7b — Mock NCCC Service（開發環境）
+
+> **設計說明：** ORCH 主動呼叫 Mock NCCC。Mock NCCC 從 card-service 取得明文卡片資料、以固定 MOCK_COMBINE_KEY 組裝 encryptedCard，再呼叫 card-service auth/authorize。
+
+#### `POST /mock-nccc/pay`
+
+- Request（來自 ORCH）：`{ cardId, amount, currency, txnTwdBaseAmount, merchantId }`
+- Feign → `GET /card-service/internal/cards/{cardId}/plain` → `{ pan, expiryMMYY, cvvItoken }`
+- 以 `MOCK_COMBINE_KEY` AES-256-GCM 加密 `{ pan, expiryMMYY, cvvItoken }` → `encryptedCard`
+- Feign → `POST /card-service/auth/authorize`（`{ encryptedCard, amount, currency, txnTwdBaseAmount, merchantId }`）
+- 回傳 `{ challengeRef }` 給 ORCH
+- spec: `spec/mock-nccc/pay.md`（待補）
+
+#### `POST /mock-nccc/pay/confirm`
+
+- Request（來自 ORCH）：`{ challengeRef, otp }`
+- Feign → `POST /card-service/auth/verify-challenge`（`{ challengeRef, otp }`）
+- 回傳 `{ result, txnId?, cardType?, maskedPan?, reason?, remainingAttempts? }` 給 ORCH
+- spec: `spec/mock-nccc/pay-confirm.md`（待補）
+
+#### card-service 內部卡片查詢端點
+
+- `GET /card-service/internal/cards/{cardId}/plain`（Nginx 封鎖外部流量）
+- Response：`{ pan, expiryMMYY, cvvItoken }`（僅 dev/mock profile 啟用）
+- spec: `spec/card-service/card-plain.md`（待補）
+
+---
+
+## Phase 8 — card-service auth/authorize（OTP 生成 + 限額核查）
+
+**目標：** 驗卡、限額核查、生成 OTP 並發送 SMS
+
+> **重要：** card-service 在此設計下**不呼叫 FX Service 也不呼叫 Wallet Service**。`txnTwdBaseAmount` 由 ORCH 計算後透過 MockNCCC 傳入請求。Wallet reserve/confirm/release 由 ORCH 統一處理。
 
 > spec: `spec/card-service/card-auth-authorize.md`（待補）
 
-### Redis OTP Session
+### Redis OTP Session（card-service 所有）
 
 - Key：`otp:{challengeRef}`
 - TTL：180 秒
@@ -160,15 +231,12 @@ isOverseas = false → domestic_reward_rate
     "txnCurrency": "USD",
     "txnTwdBaseAmount": 316000,
     "isOverseas": true,
-    "pointsToUse": 5000,
-    "reservationId": 789,
-    "merchantId": "MERCHANT_001",
     "otpValue": "123456"
   }
   ```
 
-  > `txnTwdBaseAmount`：台幣交易等於 txnAmount；外幣呼叫 `POST /fx/convert` 換算（分）。
-  > `reservationId`：若 pointsToUse = 0 則為 null。
+  > `txnTwdBaseAmount`：由 ORCH 計算並傳入 authorize 請求，card-service 儲存至 OTP Session 供 verify-challenge 使用（daily limit 累計）。
+  > `pointsToUse` / `reservationId` 已移至 ORCH Saga State，不存於 OTP Session。
 
 ### UseCase Flow（`POST /card-service/auth/authorize`）
 
@@ -176,21 +244,16 @@ isOverseas = false → domestic_reward_rate
 |------|------|
 | 1 | 以 `CombineKeyHolder` 取得 combineKey；null → 拋 CA00013 HTTP 503 |
 | 2 | AES-256-GCM 解密 `encryptedCard` → `{ pan, expiryMMYY, cvvItoken }` |
-| 3 | HMAC-SHA256(pan) → pan_hash，查詢 DB 識別 userId / cardId |
-| 4 | 比對 cvvItoken：received cvvItoken == card.cvv_itoken；不符 → CA00014 CVV_ITOKEN_MISMATCH |
+| 3 | HMAC-SHA256(pan) → pan_hash，查詢 DB 識別 userId / cardId / cardType / maskedPan |
+| 4 | 比對 cvvItoken：received == card.cvv_itoken；不符 → CA00014 |
 | 5 | 驗卡：status = ACTIVE、expiry 未過期（CA00002 / CA00003 / CA00004） |
-| 6 | 幣別判斷：TWD → txnTwdBaseAmount = amount；外幣 → Feign `POST /fx/convert` |
-| 7 | 單筆限額：txnTwdBaseAmount ≤ single_txn_limit（INFINITE 跳過）→ CA00006 |
-| 8 | 當日累計：Redis `card:daily:{cardId}:{yyyyMMdd}` + txnTwdBaseAmount ≤ daily_limit → CA00007 |
-| 9 | 點數折抵：`pointsToUse = usePoints ? min(available_balance, txnTwdBaseAmount) : 0` |
-| 10 | 若 pointsToUse > 0：Feign `wallet-service reserve(userId, pointsToUse)` → reservationId |
-| 11 | 產生 6 位 OTP（SecureRandom） |
-| 12 | 發布 RabbitMQ `notification.otp.sms`（userId、手機號遮罩、otp）→ notify-service 送 SMS |
-| 13 | 儲存 Redis OTP Session（TTL 180s） |
-| 14 | 清零 PAN 明文位元組（try-finally 保證執行） |
-| 15 | Response：`{ challengeRef, pointsToUse, estimatedTwdAmount }` |
-
-> 驗卡失敗 / 限額超過 → 若已 reserve 則呼叫 `wallet-service release(reservationId)`。
+| 6 | 單筆限額：txnTwdBaseAmount ≤ single_txn_limit（INFINITE 跳過）→ CA00006 |
+| 7 | 當日累計：Redis GET `card:daily:{cardId}:{yyyyMMdd}` + txnTwdBaseAmount ≤ daily_limit → CA00007 |
+| 8 | 產生 6 位 OTP（SecureRandom） |
+| 9 | 發布 RabbitMQ `notification.otp.sms`（userId、手機號遮罩、otp）→ notify-service 送 SMS |
+| 10 | 儲存 Redis OTP Session（TTL 180s） |
+| 11 | 清零 PAN 明文位元組（try-finally 保證執行） |
+| 12 | Response：`{ challengeRef }` |
 
 ### Notification Service — OTP SMS
 
@@ -200,9 +263,11 @@ isOverseas = false → domestic_reward_rate
 
 ---
 
-## Phase 9 — card-service auth/verify-challenge（OTP 驗證 + 授權完成）
+## Phase 9 — card-service auth/verify-challenge（OTP 驗證）
 
-**目標：** 驗證使用者輸入的 OTP，觸發點數確認與 Kafka 事件發布
+**目標：** 驗證 OTP、更新每日累計限額、分配 txnId；Wallet confirm 與 Kafka 發布由 ORCH 執行
+
+> **重要：** verify-challenge **不呼叫** wallet-service，也**不發布** Kafka。這兩個動作已移至 ORCH Leg 2 flow（Phase 7a Step 3–4）。
 
 > spec: `spec/card-service/card-auth-verify-challenge.md`（待補）
 
@@ -210,36 +275,36 @@ isOverseas = false → domestic_reward_rate
 
 | Step | 說明 |
 |------|------|
-| 1 | Redis `otp:{challengeRef}` 不存在 → `DECLINED + SESSION_EXPIRED` |
+| 1 | Redis GET `otp:{challengeRef}`；不存在 → Response `{ result: DECLINED, reason: SESSION_EXPIRED }` |
 | 2 | 比對 OTP 值（session.otpValue == 輸入值） |
 | **OTP 正確** | |
-| 3 | 若有 reservationId → Feign `wallet-service confirmDeduct(reservationId)` |
-| 4 | Redis INCR `card:daily:{cardId}:{yyyyMMdd}`（加 txnTwdBaseAmount，TTL 至當日 23:59:59） |
-| 5 | 分配 txnId（Snowflake） |
-| 6 | Kafka Publish `txn.card.authorized`（見 Kafka Payload） |
-| 7 | 刪除 Redis OTP Session key |
-| 8 | Response：`{ result: APPROVED, txnId }` |
+| 3 | Redis INCR `card:daily:{cardId}:{yyyyMMdd}`（加 txnTwdBaseAmount，TTL 至當日 23:59:59） |
+| 4 | 分配 txnId（Snowflake） |
+| 5 | DEL `otp:{challengeRef}` |
+| 6 | Response：`{ result: APPROVED, txnId, cardType, maskedPan }` |
 | **OTP 錯誤** | |
-| 9 | INCR `otp:attempt:{challengeRef}`（TTL 180s）；≥ 3 → session 作廢，若有 reservationId → release；Response：`DECLINED + SESSION_VOIDED` |
-| 10 | INCR `otp:card:fail:{cardId}`（TTL 900s）；≥ 5 → 卡片 FROZEN + Kafka `card.risk.otp-threshold-exceeded` + release；Response：`DECLINED + CARD_LOCKED` |
-| 11 | Response：`DECLINED + OTP_FAILED`（含剩餘次數） |
+| 7 | INCR `otp:attempt:{challengeRef}`（TTL 180s）；≥ 3 → DEL session；Response：`{ result: DECLINED, reason: SESSION_VOIDED }` |
+| 8 | INCR `otp:card:fail:{cardId}`（TTL 900s）；≥ 5 → 卡片 FROZEN + Kafka `card.risk.otp-threshold-exceeded`；Response：`{ result: DECLINED, reason: CARD_LOCKED }` |
+| 9 | Response：`{ result: DECLINED, reason: OTP_FAILED, remainingAttempts }` |
 
-### Kafka Payload — `txn.card.authorized`
+> **ORCH 負責** wallet release（SESSION_VOIDED / CARD_LOCKED 時）與 wallet confirmDeduct / Kafka txn.card.authorized publish（APPROVED 時）。
+
+### Kafka Payload — `txn.card.authorized`（由 ORCH 發布）
 
 ```json
 {
-  "txnId": "Snowflake ID",
-  "userId": 123,
-  "cardId": 456,
-  "cardType": "OVERSEAS",
-  "maskedPan": "****-****-****-1234",
-  "merchantId": "MERCHANT_001",
-  "txnAmount": 10000,
-  "txnCurrency": "USD",
-  "txnTwdBaseAmount": 316000,
-  "isOverseas": true,
-  "pointsToUse": 5000,
-  "txnTimestamp": "2026-03-30T10:00:00.000Z"
+  "txnId": "Snowflake ID（來自 verify-challenge response）",
+  "userId": "來自 Saga State",
+  "cardId": "來自 Saga State",
+  "cardType": "來自 verify-challenge response",
+  "maskedPan": "來自 verify-challenge response",
+  "merchantId": "來自 Saga State",
+  "txnAmount": "來自 Saga State",
+  "txnCurrency": "來自 Saga State",
+  "txnTwdBaseAmount": "來自 Saga State",
+  "isOverseas": "來自 Saga State",
+  "pointsToUse": "來自 Saga State",
+  "txnTimestamp": "ORCH 發布時間（ISO-8601）"
 }
 ```
 
@@ -289,12 +354,12 @@ isOverseas = false → domestic_reward_rate
 
 **目標：** 驗證完整交易流程的所有路徑
 
-- [ ] 正常台幣刷卡（usePoints = false）：App → BFF → Mock NCCC → card-service → Kafka → Ledger / Notification
+- [ ] 正常台幣刷卡（usePoints = false）：App → BFF → ORCH → MockNCCC → card-service → ORCH Kafka → Ledger / Notification
 - [ ] 台幣刷卡 + 點數全額折抵（available_balance >= txnAmount）
 - [ ] 台幣刷卡 + 點數部分折抵（available_balance < txnAmount）
-- [ ] 外幣交易（USD）：驗證 fx-service convert、txnTwdBaseAmount、fx_fee 分錄
-- [ ] OTP 失敗 → 重試 → 第 3 次授權作廢（per-session）→ wallet release
-- [ ] 卡片鎖定（per-card ≥ 5 次 / 15 分鐘）→ Kafka `card.risk.otp-threshold-exceeded` + wallet release
+- [ ] 外幣交易（USD）：驗證 ORCH FX convert、txnTwdBaseAmount、fx_fee 分錄
+- [ ] OTP 失敗 → 重試 → 第 3 次授權作廢（per-session）→ ORCH wallet release
+- [ ] 卡片鎖定（per-card ≥ 5 次 / 15 分鐘）→ Kafka `card.risk.otp-threshold-exceeded` + ORCH wallet release
 - [ ] Session 過期（Redis TTL 180s 到期 → SESSION_EXPIRED）
 - [ ] 單筆限額超過 → DECLINED（CA00006），無 reserve
 - [ ] 當日累計超限 → DECLINED（CA00007），無 reserve
