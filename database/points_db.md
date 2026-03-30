@@ -13,8 +13,10 @@
 | File | Type | Description |
 |------|------|-------------|
 | `V3.0.0__create_point_issuance_log_table.sql` | DDL | Idempotency and audit log for Kafka-driven point issuance events |
+| `V3.0.1__create_reward_plan_table.sql` | DDL | Base reward rates per card type |
+| `V3.0.2__seed_reward_plan.sql` | DML | Initial rate seed data (mirrors `card_type_limit` base rates) |
 
-> **Future migrations (deferred):** `reward_plan` and `reward_plan_mcc` tables will be added in a future phase when MCC-based bonus calculation is implemented.
+> **Deferred:** `reward_plan_mcc` (MCC-based bonus rates) will be added in a future phase.
 
 ---
 
@@ -55,3 +57,42 @@ CREATE TABLE `point_issuance_log` (
 > **Immutability:** Rows are insert-only. No `updated_at` column.
 >
 > **Cross-service reference:** `batch_id` references `point_reward_batch.batch_id` in `wallet_db`. No DB-level FK across databases.
+
+---
+
+### `reward_plan`
+
+> **Source migration:** `V3.0.1__create_reward_plan_table.sql`
+> **Seed migration:** `V3.0.2__seed_reward_plan.sql`
+> **Last updated:** 2026-03
+> **Mutability:** Seed data — read-only at runtime. One row per card type.
+
+Points Service's local copy of base reward rates. Decoupled from `card_type_limit` in `card_db` to avoid cross-service DB access. Must be kept in sync with `card_type_limit` via manual migration when rates change.
+
+```sql
+CREATE TABLE `reward_plan` (
+  `card_type`             VARCHAR(20)   NOT NULL  COMMENT 'PK: CLASSIC / OVERSEAS / PREMIUM / INFINITE',
+  `domestic_reward_rate`  DECIMAL(5,4)  NOT NULL  COMMENT 'Base domestic cashback rate, e.g. 0.0100 = 1%',
+  `overseas_reward_rate`  DECIMAL(5,4)  NOT NULL  COMMENT 'Base overseas cashback rate, e.g. 0.0500 = 5%',
+  `created_at`            DATETIME(3)   NOT NULL,
+  `updated_at`            DATETIME(3)   NOT NULL,
+  PRIMARY KEY (`card_type`)
+) ENGINE = InnoDB
+  DEFAULT CHARSET = utf8mb4
+  COLLATE = utf8mb4_unicode_ci;
+```
+
+**Seed data (`V3.0.2__seed_reward_plan.sql`):**
+
+```sql
+INSERT INTO `reward_plan`
+  (`card_type`, `domestic_reward_rate`, `overseas_reward_rate`, `created_at`, `updated_at`)
+VALUES
+  ('CLASSIC',  0.0100, 0.0000, NOW(3), NOW(3)),
+  ('OVERSEAS', 0.0000, 0.0500, NOW(3), NOW(3)),
+  ('PREMIUM',  0.0200, 0.0500, NOW(3), NOW(3)),
+  ('INFINITE', 0.0200, 0.0500, NOW(3), NOW(3));
+```
+
+> **Rate selection:** `isOverseas = true` → use `overseas_reward_rate`; `isOverseas = false` → use `domestic_reward_rate`.
+> **OVERSEAS domestic rate is 0:** OVERSEAS card type earns no domestic cashback (only overseas). If `reward_points` rounds to 0, Points Service logs `SKIP` and issues no batch.

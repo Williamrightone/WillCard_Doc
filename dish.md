@@ -347,36 +347,38 @@ notify-service 消費 RabbitMQ `notification.otp.send` 訊息（`{ userId, otp }
 
 > **架構說明：** Points Service、Ledger Service、Notification Service 各自獨立訂閱同一 Kafka Topic（fan-out），互不依賴。
 
+### Wallet Service 補齊（Phase 2 缺口，Phase 10 補寫）
+
+> spec: `spec/wallet-service/reserve.md` ✅
+> spec: `spec/wallet-service/confirm-deduct.md` ✅（含 release 端點）
+
 ### Points Service（Phase 3 設計，Phase 10 實作）
 
+> spec: `spec/points-service/txn-authorized-consumer.md` ✅
+
 - Kafka Consumer：`txn.card.authorized`（冪等：`uk_pil_source_txn_id`）
-- 計算 reward_points → 呼叫 wallet-service credit API → 建立 `point_reward_batch`（PENDING）
+- `reward_plan` 表（points_db V3.0.1 / V3.0.2）提供基礎費率（與 card_type_limit 同步，不跨服務查詢）
+- 計算 `floor(txnTwdBaseAmount × rate)` → 呼叫 wallet-service credit API → `point_reward_batch`（PENDING）
+- 回饋以完整 txnTwdBaseAmount 計算（不扣除 pointsToUse）
 - 到期日：txnTimestamp 所在月份一年後同月最後一刻
 
 ### Ledger Service
 
-- [ ] `journal_entry` 表（ledger_db，insert-only，無 updated_at）
-  - `entry_id` BIGINT Snowflake PK
-  - `txn_id` VARCHAR(64)
-  - `entry_seq` INT（同一交易內序號）
-  - `account_code` VARCHAR(10)（1001 應收款、2001 代付款、3001 台幣收入）
-  - `debit_amount` / `credit_amount` BIGINT（分）
-  - `currency` VARCHAR(3)
-  - `created_at` DATETIME(3)
-  - `idempotency_key` VARCHAR(128) UNIQUE — `{txnId}_{entrySeq}`
+> spec: `spec/ledger-service/txn-authorized-consumer.md` ✅
+> database: `database/ledger_db.md` ✅（journal_entry + fx_rate_snapshot）
 
-- [ ] Kafka Consumer：`txn.card.authorized`（冪等：ON DUPLICATE KEY IGNORE）
-
-- [ ] 三種情境分錄：
-  - **台幣、無折抵**：DR 應收款(1001) / CR 代付款(2001) + CR 台幣收入(3001)
-  - **台幣、點數折抵**（pointsToUse > 0）：額外加點數折抵科目 CR/DR 對沖
-  - **外幣**（isOverseas = true）：額外加 DR/CR 外幣手續費（txnTwdBaseAmount × fx_fee_rate）
-
-- [ ] SETTLEMENT 分錄（T+1 排程）：DR 代付款(2001) / CR 清算款(1002)
+- Kafka Consumer：`txn.card.authorized`（冪等：`{txnId}_{entrySeq}` unique key）
+- 四種情境分錄（台幣/外幣 × 有無點數折抵）：
+  - **情境 A** 台幣、無折抵：DR 1001 / CR 2001
+  - **情境 B** 台幣、有折抵：DR 1001 / CR 2001 + CR 4001 / CR 1001（對沖）
+  - **情境 C** 外幣、無折抵：DR 1001 / CR 2001(net) + CR 3001(fxFee)
+  - **情境 D** 外幣、有折抵：情境 C + CR 4001 / CR 1001（對沖）
+- `fx_rate_snapshot` 表（ledger_db V6.0.1）提供外幣手續費率（與 card_type_limit 同步）
+- [ ] SETTLEMENT 分錄（T+1 排程）：DR 2001 / CR 1002（待後續 Phase）
 
 ### Notification Service — 交易收據
 
-- Kafka Consumer：`txn.card.authorized` → 推播 + Email 消費明細
+- [ ] Kafka Consumer：`txn.card.authorized` → 推播 + Email 消費明細（規格待補）
 - Queue：`notification.txn.receipt`（內部轉發）
 
 ---
