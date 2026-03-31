@@ -42,7 +42,7 @@ A live rate strategy is used (no rate locking) — each call uses the current ca
 |-------|------|-------------|-------|
 | originalAmount | BigDecimal | Original amount (source currency) | |
 | fromCurrency | String | Source currency (ISO 4217) | |
-| convertedAmount | BigDecimal | Converted amount (target currency) | Rounded to 2 decimal places |
+| convertedAmount | BigDecimal | Converted amount (target currency) | Rounded to 2 decimal places. **Callers that store this as Long (TWD fen) must apply: `convertedAmount.setScale(0, RoundingMode.HALF_UP).longValue()`** |
 | toCurrency | String | Target currency (ISO 4217) | |
 | rate | BigDecimal | Applied exchange rate | 10 decimal places |
 | rateTimestamp | Long | Rate data timestamp (epoch millis) | For Orchestrator to record in transaction log |

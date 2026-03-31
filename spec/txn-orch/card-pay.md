@@ -73,11 +73,11 @@ Returns `challengeRef`, `pointsToUse`, and `estimatedTwdAmount` to BFF.
 
 | Step | Type | Description |
 |------|------|-------------|
-| 1 | `[FEIGN]` | **FX Conversion:** if `currency = TWD` → `txnTwdBaseAmount = amount`; else call `FxServiceFeignClient.convert(amount, currency, "TWD")` → `POST /fx-service/convert` → `txnTwdBaseAmount`; see [fx-service/convert.md](../fx-service/convert.md) |
+| 1 | `[FEIGN]` | **FX Conversion:** if `currency = TWD` → `txnTwdBaseAmount = amount`; else call `FxServiceFeignClient.convert(amount, currency, "TWD")` → `POST /fx-service/convert` → `convertedAmount (BigDecimal)`; convert to Long: `txnTwdBaseAmount = convertedAmount.setScale(0, RoundingMode.HALF_UP).longValue()` (TWD fen, half-up rounding); see [fx-service/convert.md](../fx-service/convert.md) |
 | 2 | `[DOMAIN]` | `isOverseas = (currency != "TWD")` |
 | 3 | `[FEIGN]` | **Points Calculation:** if `usePoints = true` → `WalletFeignClient.getBalance(userId)` → `availableBalance`; `pointsToUse = min(availableBalance, txnTwdBaseAmount)`; else `pointsToUse = 0`; see [wallet-service/reserve.md](../wallet-service/reserve.md) |
 | 4 | `[FEIGN]` | `MockNcccFeignClient.pay(MockNcccPayRq)` → `POST /mock-nccc/pay`; request: `{ cardId, amount, currency, txnTwdBaseAmount, merchantId }`; response: `{ challengeRef }`; see [mock-nccc/pay.md](../mock-nccc/pay.md) |
-| 5 | `[FEIGN]` | **Wallet Reserve:** if `pointsToUse > 0` → `WalletFeignClient.reserve(userId, pointsToUse)` → `reservationId`; else `reservationId = null`; see [wallet-service/reserve.md](../wallet-service/reserve.md) |
+| 5 | `[FEIGN]` | **Wallet Reserve:** if `pointsToUse > 0` → `WalletFeignClient.reserve(userId, pointsToUse, idempotencyKey: challengeRef)` → `reservationId`; else `reservationId = null`; see [wallet-service/reserve.md](../wallet-service/reserve.md) |
 | 6 | `[REDIS WRITE]` | SET `saga:{challengeRef}` = SagaState (TTL 180s); see Saga State section |
 | 7 | `[RETURN]` | Return `CardPayOrchRs { challengeRef, pointsToUse, estimatedTwdAmount: txnTwdBaseAmount }` |
 
@@ -137,5 +137,9 @@ Returns `challengeRef`, `pointsToUse`, and `estimatedTwdAmount` to BFF.
 ---
 
 ## 7. Changelog
+
+### v1.1 — 2026-03 — FX precision + reserve idempotency
+- Step 1: Specified FX `convertedAmount` (BigDecimal) → Long conversion: `setScale(0, HALF_UP).longValue()`.
+- Step 5: Reserve call now passes `idempotencyKey: challengeRef` for duplicate-call protection.
 
 ### v1.0 — 2026-03 — Initial spec

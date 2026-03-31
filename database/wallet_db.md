@@ -60,13 +60,15 @@ CREATE TABLE `wallet_account` (
 
 ```sql
 CREATE TABLE `wallet_reservation` (
-  `reservation_id` BIGINT        NOT NULL COMMENT 'PK, Snowflake ID (application-generated)',
-  `user_id`        BIGINT        NOT NULL COMMENT 'Owner; referential integrity enforced at application layer',
-  `total_amount`   BIGINT        NOT NULL COMMENT 'Total points reserved across all batches in TWD cents',
-  `status`         VARCHAR(20)   NOT NULL COMMENT 'PENDING / CONFIRMED / RELEASED',
-  `created_at`     DATETIME(3)   NOT NULL COMMENT 'Inherited from BaseTimeEntity',
-  `updated_at`     DATETIME(3)   NOT NULL COMMENT 'Inherited from BaseTimeEntity',
+  `reservation_id`  BIGINT        NOT NULL COMMENT 'PK, Snowflake ID (application-generated)',
+  `user_id`         BIGINT        NOT NULL COMMENT 'Owner; referential integrity enforced at application layer',
+  `total_amount`    BIGINT        NOT NULL COMMENT 'Total points reserved across all batches in TWD cents',
+  `status`          VARCHAR(20)   NOT NULL COMMENT 'PENDING / CONFIRMED / RELEASED',
+  `idempotency_key` VARCHAR(64)   NULL     COMMENT 'Caller-supplied deduplication key (ORCH passes challengeRef); NULL allowed for legacy or non-ORCH callers',
+  `created_at`      DATETIME(3)   NOT NULL COMMENT 'Inherited from BaseTimeEntity',
+  `updated_at`      DATETIME(3)   NOT NULL COMMENT 'Inherited from BaseTimeEntity',
   PRIMARY KEY (`reservation_id`),
+  UNIQUE KEY `uk_wr_idempotency_key` (`idempotency_key`),
   KEY `idx_wallet_reservation_user_id` (`user_id`)
 ) ENGINE = InnoDB
   DEFAULT CHARSET = utf8mb4
@@ -74,6 +76,7 @@ CREATE TABLE `wallet_reservation` (
 ```
 
 > **Status lifecycle:** `PENDING → CONFIRMED` (on `confirmDeduct`) or `PENDING → RELEASED` (on `release`). Once finalized, the status cannot be modified again.
+> **Idempotency:** `idempotency_key` UNIQUE constraint prevents duplicate reservations on ORCH retry. The scheduled cleanup job uses `created_at` to identify orphaned PENDING rows.
 
 ---
 

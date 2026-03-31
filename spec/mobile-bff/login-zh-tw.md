@@ -117,7 +117,7 @@ BFF 本身不執行密碼驗證，不簽發 Token，僅負責流程協調與 Hea
 
 | Redis Key | 操作 | TTL | 說明 |
 |-----------|------|-----|------|
-| `login:attempt:{account}` | READ / WRITE | 1200s | 滑動視窗失敗計數器 |
+| `login:attempt:{account}` | READ / WRITE | 1200s | 固定視窗失敗計數器（窗口從第一次失敗起算；TTL 僅在 key 首次建立時設定，即 INCR result = 1） |
 | `login:lock:{account}` | READ / WRITE | 1200s | 帳號鎖定旗標，key 自然過期即解鎖 |
 | `session:{memberId}` | WRITE | JWT exp（3600s） | 有效 Token 存儲，新登入覆蓋舊值，實現後踢前 |
 
@@ -136,3 +136,12 @@ BFF 本身不執行密碼驗證，不簽發 Token，僅負責流程協調與 Hea
 | 400 | ACCOUNT_LOCKED | 帳號已鎖定 | `login:lock:{account}` key 存在 |
 | 400 | INVALID_CREDENTIALS | 帳號或密碼錯誤 | auth-service 回傳驗證失敗 |
 | 500 | INTERNAL_ERROR | 系統錯誤 | 非預期例外 |
+
+---
+
+## 6. Changelog
+
+### v1.1 — 2026-03 — 更正登入計數器視窗類型
+- `login:attempt` 說明由「滑動視窗」更正為「固定視窗」（TTL 僅在 key 首次建立時設定）。
+
+### v1.0 — 2026-03 — 初始版本

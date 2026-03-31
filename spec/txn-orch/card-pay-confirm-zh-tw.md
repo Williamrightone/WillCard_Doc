@@ -146,6 +146,8 @@
 | 第二腿 — OTP_FAILED | 保留（Session 與 Reservation 仍有效） |
 | TTL 到期（180s） | Redis 自動刪除 |
 
+> **殭屍 Reservation 風險：** Saga State 因 TTL 到期被刪除後，Leg 1 已建立的 `wallet_reservation` 將永久停留在 `PENDING` 狀態——`reservationId` 隨 Saga State 一同消失，ORCH 無法追蹤。wallet-service 必須以排程任務定期釋放超過 10 分鐘仍為 PENDING 的 reservation（詳見 `reserve.md` § Scheduled Cleanup）。
+
 ---
 
 ## 7. 錯誤碼
@@ -159,5 +161,8 @@
 ---
 
 ## 8. Changelog
+
+### v1.1 — 2026-03 — 新增殭屍 Reservation 備注
+- 新增設計備注：Saga State TTL 到期後，wallet reservation 仍為 PENDING，需 wallet-service 排程清理。
 
 ### v1.0 — 2026-03 — 初始版本

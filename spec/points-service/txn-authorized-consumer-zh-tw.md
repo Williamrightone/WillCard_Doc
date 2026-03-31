@@ -71,6 +71,8 @@
 | E1 | `[DB WRITE]` | INSERT `point_issuance_log { source_txn_id, user_id, issued_amount: 0, status: 'FAILED' }` |
 | E2 | `[RETURN]` | **ACK**（記錄失敗；不 NACK——業務性失敗不使用 DLQ） |
 
+> **E1 僅處理真正的系統性失敗：** wallet credit API 已改為冪等——重複 `sourceTxnId` 呼叫將回傳 HTTP 200 及既有 `batchId`，不會拋出錯誤。因此，E1 路徑僅在真正的基礎設施故障時觸發（例如：網路逾時、DB 中斷），而非重複投遞。
+
 > **回饋基礎不扣除折抵點數（`pointsToUse`）：** 回饋以完整 `txnTwdBaseAmount` 計算——點數折抵不縮減回饋基礎。這是刻意的業務規則（WillCard 以交易總額給予回饋）。
 >
 > **冪等守衛（Step 1）：** 相同 `txnId` 的重複投遞一律跳過，無論先前狀態為何。`FAILED` 狀態同樣冪等——重複投遞後靜默跳過（需人工 DLQ 重處理）。
@@ -119,5 +121,8 @@
 ---
 
 ## 8. Changelog
+
+### v1.1 — 2026-03 — 說明 E1 適用範圍（wallet credit 冪等性修正後）
+- 新增備注：E1 路徑僅處理真正的系統性失敗；重複 `sourceTxnId` 不再觸發錯誤（wallet credit API 已改為 HTTP 200 冪等回應）。
 
 ### v1.0 — 2026-03 — 初始版本

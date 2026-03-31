@@ -117,7 +117,7 @@ Downstream services read these headers via `MemberContextFilter` (auto-configure
 
 | Redis Key | Operation | TTL | Description |
 |-----------|-----------|-----|-------------|
-| `login:attempt:{account}` | READ / WRITE | 1200s | Sliding window failure counter |
+| `login:attempt:{account}` | READ / WRITE | 1200s | Fixed-window failure counter (window starts on first failure; TTL is set only when key is first created, i.e., INCR result = 1) |
 | `login:lock:{account}` | READ / WRITE | 1200s | Account lock flag; key expiry = automatic unlock |
 | `session:{memberId}` | WRITE | JWT exp (3600s) | Active token store — new login overwrites previous token (single active session per member) |
 
@@ -136,3 +136,12 @@ Downstream services read these headers via `MemberContextFilter` (auto-configure
 | 400 | ACCOUNT_LOCKED | Account is locked | `login:lock:{account}` key exists |
 | 400 | INVALID_CREDENTIALS | Invalid credentials | auth-service returned an authentication failure |
 | 500 | INTERNAL_ERROR | Unexpected system error | Unhandled exception |
+
+---
+
+## 6. Changelog
+
+### v1.1 — 2026-03 — Clarify login counter window type
+- Renamed `login:attempt` description from "Sliding window" to "Fixed-window" (TTL set only on first INCR).
+
+### v1.0 — 2026-03 — Initial spec

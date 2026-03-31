@@ -138,6 +138,8 @@
 |-----|-----|------|
 | `bff:pay:idem:{userId}:{idempotencyKey}` | 60s | 冪等保護；防止重複發起付款 |
 
+> **刻意的 TTL 不對稱（60s vs OTP Session 180s）：** BFF 冪等窗口比 OTP Session TTL 短，屬刻意設計。60s 後允許用戶以相同 `Idempotency-Key` 重新發起支付（例如暫時性失敗後重試）。若在 60–180s 區間重新發起，會建立新的 OTP Session 與 reservation，舊的資源將依各自 TTL 自然過期。這是可接受的取捨——若 BFF 鎖定 180s，對支付 UX 過於嚴苛。
+
 ---
 
 ## 7. 錯誤碼
@@ -157,5 +159,8 @@
 ---
 
 ## 8. Changelog
+
+### v1.1 — 2026-03 — 說明 BFF 冪等 TTL 設計取捨
+- 新增備注說明為何 BFF 冪等 TTL（60s）刻意短於 OTP Session TTL（180s）。
 
 ### v1.0 — 2026-03 — 初始版本

@@ -105,7 +105,7 @@ On failure: increments both the per-session attempt counter and the per-card cro
 | 10 | `[DOMAIN]` | If `cardFailCount ≥ 5` → **Card Lock sub-path** (Steps 11–13) |
 | 11 | `[DB WRITE]` | `UPDATE card SET status = 'FROZEN', updated_at = NOW(3) WHERE card_id = session.cardId` |
 | 12 | `[REDIS WRITE]` | DEL `otp:{challengeRef}` |
-| 13 | `[KAFKA]` | Publish `card.risk.otp-threshold-exceeded` (see Kafka section); **RETURN** `{ result: DECLINED, reason: CARD_LOCKED }` |
+| 13 | `[KAFKA]` | Publish `card.risk.otp-threshold-exceeded` (see Kafka section); if publish fails → **log ERROR, do not throw, do not rollback FROZEN status**; **RETURN** `{ result: DECLINED, reason: CARD_LOCKED }` |
 | 14 | `[DOMAIN]` | If `attemptCount ≥ 3` → **Session Void sub-path**: DEL `otp:{challengeRef}`; **RETURN** `{ result: DECLINED, reason: SESSION_VOIDED }` |
 | 15 | `[RETURN]` | `{ result: DECLINED, reason: OTP_FAILED, remainingAttempts: 3 - attemptCount }` |
 
@@ -116,6 +116,8 @@ On failure: increments both the per-session attempt counter and the per-card cro
 > On the 3rd wrong OTP that also triggers the 5th card-level failure, `CARD_LOCKED` is returned (more severe).
 >
 > **TTL behaviour:** `INCR` on an existing key preserves its TTL. Only set TTL when the key is newly created (result = 1).
+>
+> **Kafka failure on CARD_LOCKED (Step 13):** If Kafka publish fails, log ERROR but do **not** throw an exception and do **not** rollback the `FROZEN` status. Card safety lock takes priority over risk event notification. Risk event loss must be compensated by monitoring alerts, not by sacrificing lock consistency.
 
 ---
 
@@ -191,5 +193,8 @@ All `DECLINED` results (including `SESSION_EXPIRED`) are returned as **HTTP 200*
 ---
 
 ## 9. Changelog
+
+### v1.1 — 2026-03 — Define Kafka failure behavior on CARD_LOCKED
+- Step 13: Kafka publish failure → log ERROR only; do not throw, do not rollback FROZEN status.
 
 ### v1.0 — 2026-03 — Initial spec

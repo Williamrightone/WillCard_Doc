@@ -21,9 +21,9 @@
 | 欄位 | 值 |
 |------|---|
 | Method | GET |
-| context-path | `/wallet` |
+| context-path | `/wallet-service` |
 | Controller mapping | `/balance` |
-| 實際接收路徑 | `/wallet/balance` |
+| 實際接收路徑 | `/wallet-service/balance` |
 | 呼叫方 | BFF（`WalletFeignClient`） |
 
 ### Request
@@ -88,3 +88,12 @@
 |---------|--------|------|---------|
 | 404 | WA00001 | WALLET_NOT_FOUND | 該 `user_id` 無對應的 `wallet_account` 記錄 |
 | 500 | INTERNAL_ERROR | 系統錯誤 | 未預期例外 |
+
+---
+
+## 6. Changelog
+
+### v1.1 — 2026-03 — 修正 context-path
+- `context-path` 由錯誤的 `/wallet` 更正為 `/wallet-service`，與其他 wallet-service 規格一致。
+
+### v1.0 — 2026-03 — 初始版本

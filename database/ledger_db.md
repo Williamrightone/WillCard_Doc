@@ -71,6 +71,11 @@ CREATE TABLE `journal_entry` (
 
 Local copy of FX fee rates per card type. Decoupled from `card_type_limit` in `card_db` to avoid cross-service DB access.
 
+> **⚠ Rate Sync SOP — HIGH RISK OPERATION**
+> `fx_rate_snapshot` is a local copy and will silently diverge from `card_type_limit.fx_fee_rate` if not updated in lockstep. When FX fee rates change:
+> 1. Submit Flyway migrations for **both** `card_db.card_type_limit` and `ledger_db.fx_rate_snapshot` in the same release.
+> 2. Rate mismatch causes **silent accounting errors** in ledger journal entries — fxFee will be calculated on stale rates with no runtime warning.
+
 ```sql
 CREATE TABLE `fx_rate_snapshot` (
   `card_type`    VARCHAR(20)   NOT NULL  COMMENT 'PK: CLASSIC / OVERSEAS / PREMIUM / INFINITE',

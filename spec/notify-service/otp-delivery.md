@@ -84,7 +84,7 @@ If no matching adapter is found (e.g., channel type in DB has no registered adap
 | Step | Type | Description |
 |------|------|-------------|
 | 1 | `[FEIGN]` | `AuthServiceFeignClient.getOtpChannels(userId)` → `GET /auth-service/internal/members/{userId}/otp-channels?status=ACTIVE`; response: list of `{ channelType, contactValue, maskedValue, isPrimary }` *(auth-service internal spec TBD)* |
-| 2 | `[DOMAIN]` | Select primary active channel from result (filter `isPrimary = true`, first match); if empty list → log WARN and skip delivery (no channel registered) |
+| 2 | `[DOMAIN]` | Select primary active channel from result (filter `isPrimary = true`, first match); if empty list → **log ERROR and NACK (route to DLQ)**; no channel registered is a configuration error that requires manual intervention |
 | 3 | `[DOMAIN]` | Resolve adapter via `OtpNotificationContext.resolve(channelType)` |
 | 4 | `[DOMAIN]` | Build `OtpDeliveryCommand { contactValue, maskedValue, otp }` |
 | 5 | `[DOMAIN]` | `adapter.send(command)`; on `OtpDeliveryException` → NACK with requeue (retriable); on stub (SMS) → no-op |
@@ -117,11 +117,14 @@ Body: { "chat_id": "{contactValue}", "text": "您的 WillCard 交易驗證碼為
 |-----------|----------|
 | auth-service Feign call fails | NACK with requeue; retry up to RabbitMQ dead-letter policy |
 | Telegram API call fails (network / 4xx / 5xx) | NACK with requeue |
-| No channel registered for member | WARN log; ACK (non-retriable; user has no channel configured) |
+| No channel registered for member | **ERROR log; NACK → DLQ** (member has no OTP channel configured; OTP cannot be delivered; requires manual intervention — transaction will be stuck until session TTL expires) |
 | SMS channel selected | WARN log (stub); ACK (non-retriable; by design not implemented) |
 
 ---
 
 ## 8. Changelog
+
+### v1.1 — 2026-03 — Fix empty channel silent failure
+- Step 2: Empty OTP channel list now routes to DLQ (ERROR + NACK) instead of silent ACK. OTP delivery failure is non-recoverable without manual action.
 
 ### v1.0 — 2026-03 — Initial spec; Telegram implemented, SMS stub

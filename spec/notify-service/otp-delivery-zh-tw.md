@@ -84,7 +84,7 @@ OtpDeliveryCommand
 | 步驟 | 類型 | 說明 |
 |------|------|------|
 | 1 | `[FEIGN]` | `AuthServiceFeignClient.getOtpChannels(userId)` → `GET /auth-service/internal/members/{userId}/otp-channels?status=ACTIVE`；Response：`[{ channelType, contactValue, maskedValue, isPrimary }]`（auth-service 內部規格待補） |
-| 2 | `[DOMAIN]` | 從結果中選取 `isPrimary = true` 的第一筆頻道；若結果為空 → 記錄 WARN，跳過發送（會員尚未設定頻道） |
+| 2 | `[DOMAIN]` | 從結果中選取 `isPrimary = true` 的第一筆頻道；若結果為空 → **記錄 ERROR，NACK（路由至 DLQ）**；未設定 OTP 頻道屬設定錯誤，需人工介入 |
 | 3 | `[DOMAIN]` | 透過 `OtpNotificationContext.resolve(channelType)` 取得對應 Adapter |
 | 4 | `[DOMAIN]` | 組裝 `OtpDeliveryCommand { contactValue, maskedValue, otp }` |
 | 5 | `[DOMAIN]` | `adapter.send(command)`；發生 `OtpDeliveryException` → NACK with requeue（可重試）；SMS stub → 無操作 |
@@ -117,11 +117,14 @@ Body: { "chat_id": "{contactValue}", "text": "您的 WillCard 交易驗證碼為
 |------|------|
 | auth-service Feign 呼叫失敗 | NACK with requeue；依 RabbitMQ Dead Letter 策略重試 |
 | Telegram API 呼叫失敗（網路 / 4xx / 5xx） | NACK with requeue |
-| 會員未登記任何頻道 | 記錄 WARN；ACK（不可重試；使用者尚未設定頻道） |
+| 會員未登記任何頻道 | **記錄 ERROR；NACK → DLQ**（OTP 無法送達，交易將卡住至 Session TTL 到期，需人工介入） |
 | 選到 SMS 頻道 | 記錄 WARN（stub）；ACK（不可重試；設計上未實作） |
 
 ---
 
 ## 8. Changelog
+
+### v1.1 — 2026-03 — 修正空 Channel 靜默失敗
+- Step 2：OTP 頻道清單為空時改為 ERROR + NACK（路由至 DLQ），不再靜默 ACK。
 
 ### v1.0 — 2026-03 — 初始版本；Telegram 實作，SMS 為 Stub

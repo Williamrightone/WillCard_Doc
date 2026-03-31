@@ -56,7 +56,7 @@
 
 | 步驟 | 類型 | 說明 | 失敗處理 |
 |------|------|------|---------|
-| 1 | `[DB READ]` | 查詢 `point_reward_batch` WHERE `source_txn_id = :sourceTxnId`；若已存在 → 拒絕 | 重複 → 拋出 `DUPLICATE_SOURCE_TXN`（409） |
+| 1 | `[DB READ]` | 查詢 `point_reward_batch` WHERE `source_txn_id = :sourceTxnId`；若已存在 → **直接回傳現有 `{ batchId }`（HTTP 200，冪等成功）** | — |
 | 2 | `[DB READ]` | 查詢 `wallet_account` WHERE `user_id = :userId`；確認帳戶存在 | 不存在 → 拋出 `WALLET_NOT_FOUND`（404） |
 | 3 | `[DOMAIN]` | 產生 Snowflake `batch_id`；設定 `remaining_balance = issuedAmount`；`status = PENDING` | — |
 | 4 | `[DB WRITE]` | INSERT `point_reward_batch`（`batch_id`、`user_id`、`source_txn_id`、`issued_amount`、`remaining_balance`、`status = PENDING`、`expires_at`、timestamps） | DB 錯誤 → 拋出 `INTERNAL_ERROR` |
@@ -88,5 +88,15 @@
 | HTTP 狀態 | 錯誤碼 | 說明 | 觸發條件 |
 |---------|--------|------|---------|
 | 404 | WALLET_NOT_FOUND | 錢包帳戶不存在 | `userId` 無對應的 `wallet_account` 記錄 |
-| 409 | DUPLICATE_SOURCE_TXN | 來源交易重複 | `sourceTxnId` 已存在於 `point_reward_batch` |
 | 500 | INTERNAL_ERROR | 系統錯誤 | 未預期例外 |
+
+> **冪等設計：** `sourceTxnId` 重複的請求回傳 HTTP 200 並附上現有 `batchId`，不拋出錯誤。此設計防止 Points Service 在 wallet batch 已建立但 `point_issuance_log` INSERT 尚未提交時（崩潰恢復情境）誤記錄 `FAILED` 狀態。
+
+---
+
+## 6. Changelog
+
+### v1.1 — 2026-03 — 重複 sourceTxnId 改為冪等成功
+- Step 1：重複處理由 409 DUPLICATE_SOURCE_TXN 改為冪等 HTTP 200（回傳現有 batchId），防止 Points Service 崩潰恢復時產生不一致狀態。
+
+### v1.0 — 2026-03 — 初始版本

@@ -21,9 +21,9 @@ Reads the `wallet_account` record for the requesting user and returns `available
 | Field | Value |
 |-------|-------|
 | Method | GET |
-| context-path | `/wallet` |
+| context-path | `/wallet-service` |
 | Controller mapping | `/balance` |
-| Full path | `/wallet/balance` |
+| Full path | `/wallet-service/balance` |
 | Caller | BFF (`WalletFeignClient`) |
 
 ### Request
@@ -88,3 +88,12 @@ No request body. User identity is passed via the `X-Member-Id` header injected b
 |-------------|------------|-------------|---------|
 | 404 | WA00001 | WALLET_NOT_FOUND | No `wallet_account` record for this `user_id` |
 | 500 | INTERNAL_ERROR | System error | Unexpected exception |
+
+---
+
+## 6. Changelog
+
+### v1.1 — 2026-03 — Fix context-path
+- Corrected `context-path` from `/wallet` to `/wallet-service` to match all other wallet-service specs.
+
+### v1.0 — 2026-03 — Initial spec

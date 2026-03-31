@@ -146,6 +146,8 @@ Returns the final transaction result to BFF.
 | Leg 2 — OTP_FAILED | Retained (session and reservation still active) |
 | TTL expires (180s) | Auto-deleted by Redis |
 
+> **Orphaned reservation risk:** When Saga State expires via TTL, any `wallet_reservation` created in Leg 1 remains `PENDING` indefinitely — the `reservationId` is lost along with the Saga State and cannot be recovered from ORCH. A scheduled cleanup job in wallet-service must periodically release PENDING reservations older than 10 minutes (see `reserve.md` § Scheduled Cleanup).
+
 ---
 
 ## 7. Error Codes
@@ -159,5 +161,8 @@ Returns the final transaction result to BFF.
 ---
 
 ## 8. Changelog
+
+### v1.1 — 2026-03 — Add orphaned reservation note
+- Added design note: TTL-expired Saga State leaves wallet reservation in PENDING; requires wallet-service scheduled cleanup.
 
 ### v1.0 — 2026-03 — Initial spec

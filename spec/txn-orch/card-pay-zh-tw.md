@@ -73,11 +73,11 @@
 
 | 步驟 | 類型 | 說明 |
 |------|------|------|
-| 1 | `[FEIGN]` | **FX 換算：** 若 `currency = TWD` → `txnTwdBaseAmount = amount`；否則呼叫 `FxServiceFeignClient.convert(amount, currency, "TWD")` → `POST /fx-service/convert` → `txnTwdBaseAmount`；見 [fx-service/convert-zh-tw.md](../fx-service/convert-zh-tw.md) |
+| 1 | `[FEIGN]` | **FX 換算：** 若 `currency = TWD` → `txnTwdBaseAmount = amount`；否則呼叫 `FxServiceFeignClient.convert(amount, currency, "TWD")` → `POST /fx-service/convert` → `convertedAmount（BigDecimal）`；轉為 Long：`txnTwdBaseAmount = convertedAmount.setScale(0, RoundingMode.HALF_UP).longValue()`（TWD 分，半進位四捨五入）；見 [fx-service/convert-zh-tw.md](../fx-service/convert-zh-tw.md) |
 | 2 | `[DOMAIN]` | `isOverseas = (currency != "TWD")` |
 | 3 | `[FEIGN]` | **點數計算：** 若 `usePoints = true` → `WalletFeignClient.getBalance(userId)` → `availableBalance`；`pointsToUse = min(availableBalance, txnTwdBaseAmount)`；否則 `pointsToUse = 0`；見 [wallet-service/reserve-zh-tw.md](../wallet-service/reserve-zh-tw.md) |
 | 4 | `[FEIGN]` | `MockNcccFeignClient.pay(MockNcccPayRq)` → `POST /mock-nccc/pay`；Request：`{ cardId, amount, currency, txnTwdBaseAmount, merchantId }`；Response：`{ challengeRef }`；見 [mock-nccc/pay-zh-tw.md](../mock-nccc/pay-zh-tw.md) |
-| 5 | `[FEIGN]` | **Wallet 預留：** 若 `pointsToUse > 0` → `WalletFeignClient.reserve(userId, pointsToUse)` → `reservationId`；否則 `reservationId = null`；見 [wallet-service/reserve-zh-tw.md](../wallet-service/reserve-zh-tw.md) |
+| 5 | `[FEIGN]` | **Wallet 預留：** 若 `pointsToUse > 0` → `WalletFeignClient.reserve(userId, pointsToUse, idempotencyKey: challengeRef)` → `reservationId`；否則 `reservationId = null`；見 [wallet-service/reserve-zh-tw.md](../wallet-service/reserve-zh-tw.md) |
 | 6 | `[REDIS WRITE]` | SET `saga:{challengeRef}` = SagaState（TTL 180s）；見 Saga State 章節 |
 | 7 | `[RETURN]` | 回傳 `CardPayOrchRs { challengeRef, pointsToUse, estimatedTwdAmount: txnTwdBaseAmount }` |
 
@@ -137,5 +137,9 @@
 ---
 
 ## 7. Changelog
+
+### v1.1 — 2026-03 — FX 精度 + Reserve 冪等性
+- Step 1：明確 FX `convertedAmount`（BigDecimal）→ Long 轉換方式：`setScale(0, HALF_UP).longValue()`。
+- Step 5：Reserve 呼叫新增 `idempotencyKey: challengeRef`，防止 ORCH 崩潰後重試雙重扣款。
 
 ### v1.0 — 2026-03 — 初始版本

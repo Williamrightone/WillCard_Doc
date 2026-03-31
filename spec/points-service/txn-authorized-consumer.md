@@ -71,6 +71,8 @@ All processing is idempotent via `uk_pil_source_txn_id` in `point_issuance_log`.
 | E1 | `[DB WRITE]` | INSERT `point_issuance_log { source_txn_id, user_id, issued_amount: 0, status: 'FAILED' }` |
 | E2 | `[RETURN]` | **ACK** (log failure; do not NACK — DLQ not used for business failures) |
 
+> **E1 handles only true system failures:** The wallet credit API is idempotent — a duplicate `sourceTxnId` call returns HTTP 200 with the existing `batchId` rather than an error. Therefore, E1 is only reached when a genuine infrastructure failure occurs (e.g., network timeout, DB outage), not on duplicate delivery.
+
 > **Reward base excludes points redeemed (`pointsToUse`):** Reward is calculated on the full `txnTwdBaseAmount` — points redemption does not reduce the reward base. This is an intentional business rule (WillCard rewards based on gross transaction amount).
 >
 > **Idempotency guard (Step 1):** Any re-delivery of the same `txnId` event is safely skipped regardless of prior `status`. The `FAILED` case is also idempotent — a re-delivery after `FAILED` is silently skipped (requires manual DLQ reprocess for retry).
@@ -119,5 +121,8 @@ All processing is idempotent via `uk_pil_source_txn_id` in `point_issuance_log`.
 ---
 
 ## 8. Changelog
+
+### v1.1 — 2026-03 — Clarify E1 scope after wallet credit idempotency fix
+- Added note: E1 path handles only true system failures; duplicate `sourceTxnId` is no longer an error (wallet credit API returns HTTP 200 idempotently).
 
 ### v1.0 — 2026-03 — Initial spec

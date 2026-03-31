@@ -105,7 +105,7 @@
 | 10 | `[DOMAIN]` | 若 `cardFailCount ≥ 5` → **卡片鎖定子路徑**（Steps 11–13） |
 | 11 | `[DB WRITE]` | `UPDATE card SET status = 'FROZEN', updated_at = NOW(3) WHERE card_id = session.cardId` |
 | 12 | `[REDIS WRITE]` | DEL `otp:{challengeRef}` |
-| 13 | `[KAFKA]` | 發布 `card.risk.otp-threshold-exceeded`（見 Kafka 章節）；**RETURN** `{ result: DECLINED, reason: CARD_LOCKED }` |
+| 13 | `[KAFKA]` | 發布 `card.risk.otp-threshold-exceeded`（見 Kafka 章節）；若發布失敗 → **記錄 ERROR，不拋出例外，不 rollback FROZEN 狀態**；**RETURN** `{ result: DECLINED, reason: CARD_LOCKED }` |
 | 14 | `[DOMAIN]` | 若 `attemptCount ≥ 3` → **Session 作廢子路徑**：DEL `otp:{challengeRef}`；**RETURN** `{ result: DECLINED, reason: SESSION_VOIDED }` |
 | 15 | `[RETURN]` | `{ result: DECLINED, reason: OTP_FAILED, remainingAttempts: 3 - attemptCount }` |
 
@@ -116,6 +116,8 @@
 > 若第 3 次 OTP 錯誤同時觸發第 5 次卡片層級失敗，回傳 `CARD_LOCKED`（更嚴重）。
 >
 > **TTL 行為：** `INCR` 不影響既有 key 的 TTL。僅在 key 新建時（結果 = 1）設定 TTL。
+>
+> **CARD_LOCKED 時 Kafka 發布失敗（Step 13）：** 若 Kafka 發布失敗，僅記錄 ERROR，**不拋出例外，不 rollback FROZEN 狀態**。卡片安全鎖定的優先級高於風控事件通知。風控事件遺失應由監控告警補償，而非犧牲鎖卡一致性。
 
 ---
 
@@ -191,5 +193,8 @@
 ---
 
 ## 9. Changelog
+
+### v1.1 — 2026-03 — 定義 CARD_LOCKED Kafka 失敗行為
+- Step 13：Kafka 發布失敗時僅記錄 ERROR，不拋出例外，不 rollback FROZEN 狀態。
 
 ### v1.0 — 2026-03 — 初始版本

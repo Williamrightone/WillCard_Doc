@@ -56,7 +56,7 @@ The batch transitions to `CONFIRMED` via the wallet-service T+1 settlement job (
 
 | Step | Type | Description | Failure Handling |
 |------|------|-------------|-----------------|
-| 1 | `[DB READ]` | Check `point_reward_batch` WHERE `source_txn_id = :sourceTxnId`; if exists → reject | Duplicate → throw `DUPLICATE_SOURCE_TXN` (409) |
+| 1 | `[DB READ]` | Check `point_reward_batch` WHERE `source_txn_id = :sourceTxnId`; if exists → **return existing `{ batchId }` immediately (HTTP 200, idempotent success)** | — |
 | 2 | `[DB READ]` | Check `wallet_account` WHERE `user_id = :userId`; verify account exists | Not found → throw `WALLET_NOT_FOUND` (404) |
 | 3 | `[DOMAIN]` | Generate Snowflake `batch_id`; compute `remaining_balance = issuedAmount`; set `status = PENDING` | — |
 | 4 | `[DB WRITE]` | INSERT `point_reward_batch` (`batch_id`, `user_id`, `source_txn_id`, `issued_amount`, `remaining_balance`, `status = PENDING`, `expires_at`, timestamps) | DB error → throw `INTERNAL_ERROR` |
@@ -88,5 +88,15 @@ The batch transitions to `CONFIRMED` via the wallet-service T+1 settlement job (
 | HTTP Status | Error Code | Description | Trigger |
 |-------------|------------|-------------|---------|
 | 404 | WALLET_NOT_FOUND | Wallet account not found | `userId` has no `wallet_account` row |
-| 409 | DUPLICATE_SOURCE_TXN | Duplicate source transaction | `sourceTxnId` already exists in `point_reward_batch` |
 | 500 | INTERNAL_ERROR | System error | Unexpected exception |
+
+> **Idempotent by design:** Duplicate `sourceTxnId` requests return HTTP 200 with the existing `batchId` — no error is thrown. This prevents Points Service from incorrectly recording `FAILED` status when the wallet batch was already created but the Points Service log INSERT had not yet committed (crash-recovery scenario).
+
+---
+
+## 6. Changelog
+
+### v1.1 — 2026-03 — Make duplicate sourceTxnId idempotent
+- Step 1: Changed duplicate handling from 409 DUPLICATE_SOURCE_TXN to idempotent HTTP 200 (return existing batchId). Prevents crash-recovery inconsistency in Points Service.
+
+### v1.0 — 2026-03 — Initial spec

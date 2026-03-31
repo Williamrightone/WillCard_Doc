@@ -140,6 +140,8 @@ This endpoint initiates a multi-service chain. All specs below must use the **sa
 |-----|-----|---------|
 | `bff:pay:idem:{userId}:{idempotencyKey}` | 60s | Idempotency guard; prevents duplicate pay initiation |
 
+> **Intentional TTL mismatch (60s vs OTP Session 180s):** The BFF idempotency window is shorter than the OTP session TTL by design. After 60s, the user is allowed to re-initiate a payment with the same `Idempotency-Key` (e.g., to retry after a transient failure). If re-initiated between 60–180s, a new OTP session and potentially a new reservation will be created; the old ones expire naturally via their own TTLs. This is an accepted tradeoff — a 180s BFF lock would be too restrictive for payment UX.
+
 ---
 
 ## 7. Error Codes
@@ -159,5 +161,8 @@ This endpoint initiates a multi-service chain. All specs below must use the **sa
 ---
 
 ## 8. Changelog
+
+### v1.1 — 2026-03 — Document BFF idempotency TTL design tradeoff
+- Added note explaining why BFF idempotency TTL (60s) is intentionally shorter than OTP session TTL (180s).
 
 ### v1.0 — 2026-03 — Initial spec

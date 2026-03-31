@@ -44,6 +44,7 @@ Returns a `reservationId` for the Orchestrator to reference in Leg 2 (`confirmDe
 |-------|------|----------|------------|-------------|
 | userId | Long | ✅ | @NotNull | Member Snowflake ID |
 | amount | Long | ✅ | @NotNull; @Min(1) | Points to reserve (TWD cents) |
+| idempotencyKey | String | ❌ | @Size(max=64) | Caller-supplied deduplication key (ORCH passes `challengeRef`). If a PENDING reservation with the same key exists, the existing `reservationId` is returned immediately without creating a new reservation. |
 
 ### Response (`wallet.contract.dto.WalletReserveRs`)
 
@@ -59,12 +60,13 @@ Returns a `reservationId` for the Orchestrator to reference in Leg 2 (`confirmDe
 
 | Step | Type | Description |
 |------|------|-------------|
+| 0 | `[DB READ]` | **Idempotency check:** If `rq.idempotencyKey` is present → SELECT `wallet_reservation` WHERE `idempotency_key = rq.idempotencyKey AND status = 'PENDING'`; found → return existing `{ reservationId }` immediately (idempotent success) |
 | 1 | `[DB READ]` | SELECT `wallet_account` WHERE `user_id = rq.userId`; not found → `WA00001` |
 | 2 | `[DOMAIN]` | Validate `available_balance >= rq.amount`; insufficient → `WA00002` |
 | 3 | `[DB READ]` | SELECT `point_reward_batch` WHERE `user_id = rq.userId AND status = 'CONFIRMED' AND remaining_balance > 0 AND expires_at > NOW()` ORDER BY `expires_at ASC` (FIFO) |
 | 4 | `[DOMAIN]` | Traverse batches in FIFO order, accumulating until `rq.amount` is satisfied; if total available < `rq.amount` → `WA00002`; build `allocationList` of `(batchId, drawAmount)` pairs |
 | 5 | `[DOMAIN]` | Generate Snowflake `reservationId` |
-| 6 | `[DB WRITE]` | INSERT `wallet_reservation { reservation_id, user_id, total_amount: rq.amount, status: 'PENDING', created_at, updated_at }` |
+| 6 | `[DB WRITE]` | INSERT `wallet_reservation { reservation_id, user_id, total_amount: rq.amount, status: 'PENDING', idempotency_key: rq.idempotencyKey, created_at, updated_at }` |
 | 7 | `[DB WRITE]` | INSERT `wallet_reservation_item` rows — one row per `(batchId, drawAmount)` in `allocationList`; generate Snowflake `item_id` per row |
 | 8 | `[DB WRITE]` | For each item: UPDATE `point_reward_batch SET remaining_balance -= drawAmount` WHERE `batch_id = item.batchId` |
 | 9 | `[DB WRITE]` | UPDATE `wallet_account SET available_balance -= rq.amount, reserved_balance += rq.amount, updated_at = NOW(3)` WHERE `user_id = rq.userId` |
@@ -91,14 +93,31 @@ Returns a `reservationId` for the Orchestrator to reference in Leg 2 (`confirmDe
 
 | Table | Operation | Description |
 |-------|-----------|-------------|
-| `wallet_reservation` | INSERT | New reservation header (`status = PENDING`) |
+| `wallet_reservation` | INSERT | New reservation header (`status = PENDING`, `idempotency_key` stored) |
 | `wallet_reservation_item` | INSERT | One row per batch drawn in FIFO allocation |
 | `point_reward_batch` | UPDATE | `remaining_balance -= drawAmount` per allocated batch |
 | `wallet_account` | UPDATE | `available_balance -= amount`, `reserved_balance += amount` |
 
 ---
 
-## 6. Error Codes
+## 6. Scheduled Cleanup — Orphaned PENDING Reservations
+
+When the ORCH Saga State expires (TTL 180s), any associated `wallet_reservation` created in Leg 1 becomes unreachable — the `reservationId` is lost and can never be confirmed or released via normal flow.
+
+A scheduled job must run periodically to release these orphaned reservations:
+
+| Field | Value |
+|-------|-------|
+| Trigger | Every 5 minutes (configurable) |
+| Target | `wallet_reservation` WHERE `status = 'PENDING' AND created_at < NOW() - INTERVAL 10 MINUTE` |
+| Action | For each orphaned reservation: execute the same logic as `release()` — restore `point_reward_batch.remaining_balance` per item, UPDATE `wallet_account.available_balance += total_amount, reserved_balance -= total_amount`, UPDATE `status = 'RELEASED'` |
+| Atomicity | Each reservation released in its own DB transaction |
+
+> **Why 10 minutes?** Saga TTL is 180s (~3 min). A 10-minute threshold ensures no in-flight reservation is accidentally released due to clock skew or processing delay.
+
+---
+
+## 7. Error Codes
 
 | HTTP Status | Error Code | Description | Trigger Condition |
 |-------------|------------|-------------|-------------------|
@@ -108,6 +127,11 @@ Returns a `reservationId` for the Orchestrator to reference in Leg 2 (`confirmDe
 
 ---
 
-## 7. Changelog
+## 8. Changelog
+
+### v1.1 — 2026-03 — Add idempotency + scheduled cleanup
+- Added `idempotencyKey` (Optional) to request; Step 0 idempotency check before reserve execution.
+- Added § Scheduled Cleanup for orphaned PENDING reservations (Issue 2 + Issue 3).
+- `wallet_reservation` INSERT now stores `idempotency_key`.
 
 ### v1.0 — 2026-03 — Initial spec

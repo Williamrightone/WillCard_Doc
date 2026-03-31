@@ -67,7 +67,13 @@ CREATE TABLE `point_issuance_log` (
 > **Last updated:** 2026-03
 > **Mutability:** Seed data — read-only at runtime. One row per card type.
 
-Points Service's local copy of base reward rates. Decoupled from `card_type_limit` in `card_db` to avoid cross-service DB access. Must be kept in sync with `card_type_limit` via manual migration when rates change.
+Points Service's local copy of base reward rates. Decoupled from `card_type_limit` in `card_db` to avoid cross-service DB access.
+
+> **⚠ Rate Sync SOP — HIGH RISK OPERATION**
+> `reward_plan` is a local copy and will silently diverge from `card_type_limit` if not updated in lockstep. When reward rates change:
+> 1. Submit three Flyway migrations in the **same release**: `card_db.card_type_limit`, `points_db.reward_plan`, and `ledger_db.fx_rate_snapshot` (if `fx_fee_rate` also changed).
+> 2. Enforce with a PR checklist: all three migration files must be present before merge.
+> 3. Rate mismatch is a **silent financial defect** — points-service calculates wrong rewards without any error or alert. Treat as a P0 financial accuracy requirement.
 
 ```sql
 CREATE TABLE `reward_plan` (
