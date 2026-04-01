@@ -202,4 +202,4 @@ The following items are out of scope for Phase 1 and should be addressed in late
 
 ---
 
-Next Chapter: [FX Service](/guideline/10-txn-flow.md)
+Next Chapter: [Point & Wallet Management](/guideline/12-point-and-wallet-mgmt.md)

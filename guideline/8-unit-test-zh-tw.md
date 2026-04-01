@@ -293,3 +293,5 @@ BFF 與 Service 模組的差異在於：`UseCaseImpl` 位於 `application/usecas
     <include>com/willcard/bff/adapter/**</include>
 </includes>
 ```
+
+下一章: [DevOps Pipeline](/guideline/9-devops-zh-tw.md)

@@ -207,3 +207,5 @@ jobs:
 > Anticipated trigger: tag push (version tag) to `main`, targeting deployment to the k8s cluster.
 
 ---
+
+Next Chapter: [Transaction Flow](/guideline/10-txn-flow.md)

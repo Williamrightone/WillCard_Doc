@@ -202,4 +202,4 @@ final_rate = base_rate + mcc_bonus + merchant_bonus
 
 ---
 
-下一章：[交易流程](/guideline/10-txn-flow.md)
+下一章：[點數與錢包管理](/guideline/12-point-and-wallet-mgmt-zh-tw.md)

@@ -218,3 +218,5 @@ reward_points = floor(txn_twd_base_amount × (base_rate + mcc_bonus + merchant_b
 | 獎勵計畫管理 | 管理員 API，用於建立、編輯及停用含有效期間與卡別範圍的獎勵計畫。 |
 
 ---
+
+下一章：[3DS combineKey 加解密](/guideline/14-3ds-combine-key-zh-tw.md)

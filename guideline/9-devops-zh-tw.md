@@ -207,3 +207,5 @@ jobs:
 > 預計觸發條件：push tag（版號）至 `main` 後觸發，目標部署至 k8s cluster。
 
 ---
+
+下一章: [交易流程規範](/guideline/10-txn-flow-zh-tw.md)

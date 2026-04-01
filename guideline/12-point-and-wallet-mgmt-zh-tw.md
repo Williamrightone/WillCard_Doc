@@ -418,4 +418,4 @@ OTP 連錯 3 次 → `release()`：
 
 ---
 
-下一章：[回饋方案設定（Reward Plan）](/guideline/13-reward-plan.md)
+下一章：[點數發放（Reward Plan）](/guideline/13-reward-plan-zh-tw.md)

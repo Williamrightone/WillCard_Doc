@@ -218,3 +218,5 @@ reward_points = floor(txn_twd_base_amount × (base_rate + mcc_bonus + merchant_b
 | Reward plan management | Admin API for creating, editing, and deactivating reward plans with validity windows and card-type scopes. |
 
 ---
+
+Next Chapter: [3DS combineKey Encryption](/guideline/14-3ds-combine-key.md)

@@ -652,3 +652,5 @@ Every call — success or failure — must publish an event.
 - **Refund flow** — uses REVERSAL journal entries; defined in `11-refund-flow`
 - **Reward plan back-office management** — future feature
 - **Production NCCC integration** — mutual TLS, real card data path; defined in production runbook
+
+Next Chapter: [Card Management](/guideline/11-card-management.md)

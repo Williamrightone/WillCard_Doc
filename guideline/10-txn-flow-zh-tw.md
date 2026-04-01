@@ -657,3 +657,5 @@ twd_base = 3,100 | fx_fee = 46 | total_twd = 3,146 | 回饋 = 31 點
 - **退款流程** — 使用 REVERSAL 反向分錄；定義於 `11-refund-flow`
 - **回饋方案後台管理** — 後續功能
 - **正式環境 NCCC 整合** — mutual TLS、真實卡片資料路徑；定義於正式環境 runbook
+
+下一章: [卡片管理](/guideline/11-card-management-zh-tw.md)

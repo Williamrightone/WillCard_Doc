@@ -293,3 +293,5 @@ BFF differs from service modules: `UseCaseImpl` lives under `application/usecase
     <include>com/willcard/bff/adapter/**</include>
 </includes>
 ```
+
+Next Chapter: [DevOps Pipeline](/guideline/9-devops.md)
